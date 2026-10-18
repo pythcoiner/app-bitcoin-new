@@ -110,6 +110,35 @@
 #define EC_SIGN_PSBT_BIP322_EXTERNAL_INPUTS 0x0015
 
 /**
+ * GET_MUSIG2_PRENONCES
+ */
+
+// The wallet policy must be registered: a default wallet policy has no musig() key expression.
+#define EC_GET_MUSIG2_PRENONCES_MISSING_HMAC 0x0000
+
+// The wallet policy is not a tr() policy.
+#define EC_GET_MUSIG2_PRENONCES_NOT_TAPROOT 0x0001
+
+// The key expression at keyexpr_index does not exist, or is not a musig() with an internal key.
+#define EC_GET_MUSIG2_PRENONCES_NOT_INTERNAL_MUSIG 0x0002
+
+// input_count must be between 1 and 32, and the range of input positions must not overflow.
+#define EC_GET_MUSIG2_PRENONCES_INVALID_INPUT_RANGE 0x0003
+
+// j is below the high-water mark, beyond the window, or already consumed.
+#define EC_GET_MUSIG2_PRENONCES_J_NOT_AVAILABLE 0x0004
+
+// The pre-nonce state could not be loaded or created.
+#define EC_GET_MUSIG2_PRENONCES_STATE_UNAVAILABLE 0x0005
+
+/**
+ * ADVANCE_MUSIG2_PRENONCES
+ */
+
+// There is no valid pre-nonce state to advance.
+#define EC_ADVANCE_MUSIG2_PRENONCES_STATE_UNAVAILABLE 0x0000
+
+/**
  * Swap
  */
 

@@ -42,7 +42,8 @@ bool init_global_state(dispatcher_context_t *dc, sign_psbt_state_t *st);
  * skipped during signing).
  */
 bool fill_keyexpr_info_if_internal(dispatcher_context_t *dc,
-                                   sign_psbt_state_t *st,
+                                   const policy_map_wallet_header_t *wallet_header,
+                                   uint32_t master_key_fingerprint,
                                    keyexpr_info_t *keyexpr_info);
 
 /**

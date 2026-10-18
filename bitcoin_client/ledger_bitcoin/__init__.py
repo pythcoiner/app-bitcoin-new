@@ -1,7 +1,7 @@
 
 """Ledger Nano Bitcoin app client"""
 
-from .client_base import Client, TransportClient, PartialSignature, MusigPubNonce, MusigPartialSignature, SignPsbtYieldedObject, UnknownSignPsbtYieldedObject
+from .client_base import Client, TransportClient, PartialSignature, MusigPubNonce, MusigPartialSignature, Musig2PrenonceBatch, SignPsbtYieldedObject, UnknownSignPsbtYieldedObject
 from .client import createClient
 from .common import Chain
 
@@ -15,6 +15,7 @@ __all__ = [
     "PartialSignature",
     "MusigPubNonce",
     "MusigPartialSignature",
+    "Musig2PrenonceBatch",
     "SignPsbtYieldedObject",
     "UnknownSignPsbtYieldedObject",
     "createClient",

@@ -75,6 +75,18 @@ const command_descriptor_t COMMAND_DESCRIPTORS[] = {
         .ins = GET_MASTER_FINGERPRINT,
         .handler = (command_handler_t)handler_get_master_fingerprint
     },
+#ifdef HAVE_MUSIG2_PRENONCES
+    {
+        .cla = CLA_APP,
+        .ins = GET_MUSIG2_PRENONCES,
+        .handler = (command_handler_t)handler_get_musig2_prenonces
+    },
+    {
+        .cla = CLA_APP,
+        .ins = ADVANCE_MUSIG2_PRENONCES,
+        .handler = (command_handler_t)handler_advance_musig2_prenonces
+    },
+#endif
     {
         .cla = CLA_APP,
         .ins = SIGN_MESSAGE,

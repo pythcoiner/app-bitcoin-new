@@ -36,6 +36,8 @@ class BitcoinInsType(enum.IntEnum):
     GET_WALLET_ADDRESS = 0x03
     SIGN_PSBT = 0x04
     GET_MASTER_FINGERPRINT = 0x05
+    GET_MUSIG2_PRENONCES = 0x06
+    ADVANCE_MUSIG2_PRENONCES = 0x07
     SIGN_MESSAGE = 0x10
 
 class FrameworkInsType(enum.IntEnum):
@@ -168,6 +170,39 @@ class BitcoinCommandBuilder:
         return self.serialize(
             cla=self.CLA_BITCOIN,
             ins=BitcoinInsType.GET_MASTER_FINGERPRINT
+        )
+
+    def get_musig2_prenonces(
+        self,
+        wallet: WalletPolicy,
+        wallet_hmac: bytes,
+        j: int,
+        keyexpr_index: int,
+        input_start: int,
+        input_count: int,
+    ):
+        cdata: bytes = b"".join(
+            [
+                wallet.id,                                  # 32 bytes
+                wallet_hmac,                                # 32 bytes
+                j.to_bytes(4, byteorder="big"),             # 4 bytes
+                write_varint(keyexpr_index),                # varint
+                input_start.to_bytes(4, byteorder="big"),   # 4 bytes
+                input_count.to_bytes(1, byteorder="big"),   # 1 byte
+            ]
+        )
+
+        return self.serialize(
+            cla=self.CLA_BITCOIN,
+            ins=BitcoinInsType.GET_MUSIG2_PRENONCES,
+            cdata=cdata,
+        )
+
+    def advance_musig2_prenonces(self, new_hwm: int):
+        return self.serialize(
+            cla=self.CLA_BITCOIN,
+            ins=BitcoinInsType.ADVANCE_MUSIG2_PRENONCES,
+            cdata=new_hwm.to_bytes(4, byteorder="big"),
         )
 
     def sign_message(self, message: bytes, bip32_path: str):

@@ -345,16 +345,18 @@ bool __attribute__((noinline)) init_global_state(dispatcher_context_t *dc, sign_
     return true;
 }
 
-static bool __attribute__((noinline)) get_and_verify_key_info(dispatcher_context_t *dc,
-                                                              sign_psbt_state_t *st,
-                                                              uint16_t key_index,
-                                                              keyexpr_info_t *keyexpr_info) {
+static bool __attribute__((noinline)) get_and_verify_key_info(
+    dispatcher_context_t *dc,
+    const policy_map_wallet_header_t *wallet_header,
+    uint32_t master_key_fingerprint,
+    uint16_t key_index,
+    keyexpr_info_t *keyexpr_info) {
     policy_map_key_info_t key_info;
     uint8_t key_info_str[MAX_POLICY_KEY_INFO_LEN];
 
     int key_info_len = call_get_merkle_leaf_element(dc,
-                                                    st->account.wallet_header.keys_info_merkle_root,
-                                                    st->account.wallet_header.n_keys,
+                                                    wallet_header->keys_info_merkle_root,
+                                                    wallet_header->n_keys,
                                                     key_index,
                                                     key_info_str,
                                                     sizeof(key_info_str));
@@ -365,8 +367,7 @@ static bool __attribute__((noinline)) get_and_verify_key_info(dispatcher_context
     // Make a sub-buffer for the pubkey info
     buffer_t key_info_buffer = buffer_create(key_info_str, key_info_len);
 
-    if (parse_policy_map_key_info(&key_info_buffer, &key_info, st->account.wallet_header.version) ==
-        -1) {
+    if (parse_policy_map_key_info(&key_info_buffer, &key_info, wallet_header->version) == -1) {
         return false;  // should never happen
     }
 
@@ -381,7 +382,7 @@ static bool __attribute__((noinline)) get_and_verify_key_info(dispatcher_context
 
     // the rest of the function verifies if the key is indeed internal, if it has our fingerprint
     uint32_t fpr = read_u32_be(key_info.master_key_fingerprint, 0);
-    if (fpr != st->master_key_fingerprint) {
+    if (fpr != master_key_fingerprint) {
         return false;
     }
 
@@ -403,7 +404,8 @@ static bool __attribute__((noinline)) get_and_verify_key_info(dispatcher_context
 }
 
 bool fill_keyexpr_info_if_internal(dispatcher_context_t *dc,
-                                   sign_psbt_state_t *st,
+                                   const policy_map_wallet_header_t *wallet_header,
+                                   uint32_t master_key_fingerprint,
                                    keyexpr_info_t *keyexpr_info) {
     keyexpr_info_t tmp_keyexpr_info;
     // preserve the fields that are already computed outside of this function
@@ -411,7 +413,8 @@ bool fill_keyexpr_info_if_internal(dispatcher_context_t *dc,
 
     if (keyexpr_info->key_expression_ptr->type == KEY_EXPRESSION_NORMAL) {
         bool result = get_and_verify_key_info(dc,
-                                              st,
+                                              wallet_header,
+                                              master_key_fingerprint,
                                               keyexpr_info->key_expression_ptr->k.key_index,
                                               &tmp_keyexpr_info);
         if (result) {
@@ -435,7 +438,11 @@ bool fill_keyexpr_info_if_internal(dispatcher_context_t *dc,
         LEDGER_ASSERT(musig_info->n <= MAX_PUBKEYS_PER_MUSIG, "Too many keys in musig placeholder");
 
         for (int idx_in_musig = 0; idx_in_musig < musig_info->n; idx_in_musig++) {
-            if (get_and_verify_key_info(dc, st, key_indexes[idx_in_musig], &tmp_keyexpr_info)) {
+            if (get_and_verify_key_info(dc,
+                                        wallet_header,
+                                        master_key_fingerprint,
+                                        key_indexes[idx_in_musig],
+                                        &tmp_keyexpr_info)) {
                 memcpy(keyexpr_info->key_derivation,
                        tmp_keyexpr_info.key_derivation,
                        sizeof(tmp_keyexpr_info.key_derivation));
@@ -516,7 +523,10 @@ bool fill_internal_key_expressions(dispatcher_context_t *dc, sign_psbt_state_t *
             break;
         }
 
-        if (fill_keyexpr_info_if_internal(dc, st, &keyexpr_info)) {
+        if (fill_keyexpr_info_if_internal(dc,
+                                          &st->account.wallet_header,
+                                          st->master_key_fingerprint,
+                                          &keyexpr_info)) {
             if (st->account.n_internal_key_expressions >= MAX_INTERNAL_KEY_EXPRESSIONS) {
                 PRINTF("Too many internal key expressions. The maximum supported is %d\n",
                        MAX_INTERNAL_KEY_EXPRESSIONS);

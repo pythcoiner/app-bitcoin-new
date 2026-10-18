@@ -6,7 +6,7 @@ from ledgercomm.interfaces.hid_device import HID
 
 from .transport import Transport
 
-from .common import Chain
+from .common import ByteStreamParser, Chain, write_varint
 
 from .command_builder import DefaultInsType
 from .exception import DeviceException
@@ -132,6 +132,62 @@ class UnknownSignPsbtYieldedObject:
 
 SignPsbtYieldedObject = Union[PartialSignature,
                               MusigPubNonce, MusigPartialSignature, UnknownSignPsbtYieldedObject]
+
+
+MUSIG2_PRENONCE_BATCH_MAGIC = b"MPNB"
+MUSIG2_PRENONCE_BATCH_VERSION = 1
+
+
+@dataclass(frozen=True)
+class Musig2PrenonceBatch:
+    """Represents a batch of pre-issued MuSig2 pubnonces returned by get_musig2_prenonces.
+
+    It contains
+    - j, the index of the batch, that a single signing call can use;
+    - k, the index of the musig() key expression in the descriptor template;
+    - pk, the 33-byte compressed participant pubkey of the device;
+    - agg_pk, the 33-byte compressed aggregate pubkey of the musig(), before any tweak;
+    - hwm, the high-water mark of the device when the batch was issued;
+    - pubnonces, a list of (input position, 66-byte pubnonce).
+    """
+    j: int
+    k: int
+    pk: bytes
+    agg_pk: bytes
+    hwm: int
+    pubnonces: List[Tuple[int, bytes]]
+
+    def serialize(self) -> bytes:
+        """Serializes the batch in the MPNB binary form, for files and QR codes."""
+        return b"".join([
+            MUSIG2_PRENONCE_BATCH_MAGIC,
+            MUSIG2_PRENONCE_BATCH_VERSION.to_bytes(1, byteorder="big"),
+            self.j.to_bytes(4, byteorder="big"),
+            self.k.to_bytes(4, byteorder="big"),
+            self.pk,
+            self.agg_pk,
+            self.hwm.to_bytes(4, byteorder="big"),
+            write_varint(len(self.pubnonces)),
+            *(i.to_bytes(4, byteorder="big") + pubnonce for i, pubnonce in self.pubnonces),
+        ])
+
+    @classmethod
+    def deserialize(cls, data: bytes) -> "Musig2PrenonceBatch":
+        """Parses a batch in the MPNB binary form."""
+        parser = ByteStreamParser(data)
+        if parser.read_bytes(4) != MUSIG2_PRENONCE_BATCH_MAGIC:
+            raise ValueError("Invalid magic")
+        if parser.read_uint(1) != MUSIG2_PRENONCE_BATCH_VERSION:
+            raise ValueError("Unsupported version")
+        j = parser.read_uint(4)
+        k = parser.read_uint(4)
+        pk = parser.read_bytes(33)
+        agg_pk = parser.read_bytes(33)
+        hwm = parser.read_uint(4)
+        n = parser.read_varint()
+        pubnonces = [(parser.read_uint(4), parser.read_bytes(66)) for _ in range(n)]
+        parser.assert_empty()
+        return cls(j=j, k=k, pk=pk, agg_pk=agg_pk, hwm=hwm, pubnonces=pubnonces)
 
 
 class Client:
@@ -310,6 +366,56 @@ class Client:
         -------
         bytes
             The fingerprint of the master public key, as an array of 4 bytes.
+        """
+
+        raise NotImplementedError
+
+    def get_musig2_prenonces(self, wallet: WalletPolicy, wallet_hmac: bytes, j: int, keyexpr_index: int,
+                             input_start: int, input_count: int) -> Musig2PrenonceBatch:
+        """Gets the pre-issued MuSig2 pubnonces of the batch `j`, for a musig() key expression of a registered
+        wallet policy and a range of input positions. No confirmation is asked on the device.
+
+        Parameters
+        ----------
+        wallet : WalletPolicy
+            The registered wallet policy, with a musig() key expression that has an internal key.
+
+        wallet_hmac: bytes
+            The hmac obtained at wallet registration.
+
+        j: int
+            The index of the batch. It must not be consumed yet, and must be in the window of the device.
+
+        keyexpr_index: int
+            The index of the musig() key expression in the descriptor template.
+
+        input_start: int
+            The first input position.
+
+        input_count: int
+            The number of input positions, between 1 and 32.
+
+        Returns
+        -------
+        Musig2PrenonceBatch
+            The batch, with one pubnonce per input position.
+        """
+
+        raise NotImplementedError
+
+    def advance_musig2_prenonces(self, new_hwm: int) -> int:
+        """Raises the high-water mark of the pre-nonce window to `new_hwm`, consuming every batch below it.
+        A value lower than the current high-water mark changes nothing. No confirmation is asked on the device.
+
+        Parameters
+        ----------
+        new_hwm: int
+            The new high-water mark.
+
+        Returns
+        -------
+        int
+            The high-water mark of the device after the call.
         """
 
         raise NotImplementedError

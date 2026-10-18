@@ -537,7 +537,10 @@ static bool select_keyexprs_to_process(
             keyexpr_info->key_expression_ptr->type != (KeyExpressionType) required_type) {
             continue;
         }
-        if (!fill_keyexpr_info_if_internal(dc, st, keyexpr_info)) {
+        if (!fill_keyexpr_info_if_internal(dc,
+                                           &st->account.wallet_header,
+                                           st->master_key_fingerprint,
+                                           keyexpr_info)) {
             continue;
         }
         keyexpr_to_process[i] = true;

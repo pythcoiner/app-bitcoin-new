@@ -9,6 +9,10 @@ typedef enum {
     GET_WALLET_ADDRESS = 0x03,
     SIGN_PSBT = 0x04,
     GET_MASTER_FINGERPRINT = 0x05,
+#ifdef HAVE_MUSIG2_PRENONCES
+    GET_MUSIG2_PRENONCES = 0x06,
+    ADVANCE_MUSIG2_PRENONCES = 0x07,
+#endif
     SIGN_MESSAGE = 0x10,
 } command_e;
 

@@ -11,7 +11,7 @@ from ._embit.networks import NETWORKS
 from .command_builder import BitcoinCommandBuilder, BitcoinInsType
 from .common import Chain, read_uint, read_varint
 from .client_command import ClientCommandInterpreter, CCMD_YIELD_MUSIG_PARTIALSIGNATURE_TAG, CCMD_YIELD_MUSIG_PUBNONCE_TAG
-from .client_base import Client, MusigPartialSignature, MusigPubNonce, SignPsbtYieldedObject, UnknownSignPsbtYieldedObject, TransportClient, PartialSignature
+from .client_base import Client, Musig2PrenonceBatch, MusigPartialSignature, MusigPubNonce, SignPsbtYieldedObject, UnknownSignPsbtYieldedObject, TransportClient, PartialSignature
 from .client_legacy import LegacyClient
 from .exception import DeviceException
 from .errors import UnknownDeviceError
@@ -354,6 +354,52 @@ class NewClient(Client):
             raise DeviceException(error_code=sw, ins=BitcoinInsType.GET_EXTENDED_PUBKEY)
 
         return response
+
+    def get_musig2_prenonces(self, wallet: WalletPolicy, wallet_hmac: bytes, j: int, keyexpr_index: int,
+                             input_start: int, input_count: int) -> Musig2PrenonceBatch:
+        client_intepreter = ClientCommandInterpreter()
+        client_intepreter.add_known_list([k.encode() for k in wallet.keys_info])
+        client_intepreter.add_known_preimage(wallet.serialize())
+
+        # necessary for version 1 of the protocol (introduced in version 2.1.0)
+        client_intepreter.add_known_preimage(wallet.descriptor_template.encode())
+
+        sw, response = self._make_request(
+            self.builder.get_musig2_prenonces(wallet, wallet_hmac, j, keyexpr_index, input_start, input_count),
+            client_intepreter,
+        )
+
+        if sw != 0x9000:
+            raise DeviceException(error_code=sw, ins=BitcoinInsType.GET_MUSIG2_PRENONCES)
+
+        if len(response) != 33 + 33 + 4:
+            raise RuntimeError(f"Invalid response length: {len(response)}")
+
+        pubnonces: List[Tuple[int, bytes]] = []
+        for res in client_intepreter.yielded:
+            if len(res) != 4 + 66:
+                raise RuntimeError(f"Invalid yielded pubnonce length: {len(res)}")
+            pubnonces.append((int.from_bytes(res[:4], byteorder="big"), res[4:]))
+
+        return Musig2PrenonceBatch(
+            j=j,
+            k=keyexpr_index,
+            pk=response[0:33],
+            agg_pk=response[33:66],
+            hwm=int.from_bytes(response[66:70], byteorder="big"),
+            pubnonces=pubnonces,
+        )
+
+    def advance_musig2_prenonces(self, new_hwm: int) -> int:
+        sw, response = self._make_request(self.builder.advance_musig2_prenonces(new_hwm))
+
+        if sw != 0x9000:
+            raise DeviceException(error_code=sw, ins=BitcoinInsType.ADVANCE_MUSIG2_PRENONCES)
+
+        if len(response) != 4:
+            raise RuntimeError(f"Invalid response length: {len(response)}")
+
+        return int.from_bytes(response, byteorder="big")
 
     def sign_message(self, message: Union[str, bytes], bip32_path: str) -> str:
         if isinstance(message, str):
