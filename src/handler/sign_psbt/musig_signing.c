@@ -30,6 +30,9 @@
 #include "psbt.h"
 #include "sw.h"
 
+// key type, participant key, aggregate key and (tapscript only) tapleaf hash
+#define MUSIG_PSBT_ID_KEY_MAX_LEN (1 + 33 + 33 + 32)
+
 /**
  * Computes the id of the psbt-level MuSig2 signing session.
  *
@@ -373,6 +376,169 @@ bool produce_and_yield_pubnonce(dispatcher_context_t *dc,
     return true;
 }
 
+// Reads from the PSBT the pubnonce of this signer for the input, and returns the PSBT key it was
+// found at in musig_my_psbt_id_key and musig_my_psbt_id_key_len. It does not send a status word.
+static bool __attribute__((noinline)) read_my_musig_pubnonce(
+    dispatcher_context_t *dc,
+    const keyexpr_info_t *keyexpr_info,
+    const input_info_t *input,
+    const musig_per_input_info_t *musig_per_input_info,
+    uint8_t musig_my_psbt_id_key[static MUSIG_PSBT_ID_KEY_MAX_LEN],
+    size_t *musig_my_psbt_id_key_len,
+    musig_pubnonce_t *my_pubnonce) {
+    // Compute musig_my_psbt_id. It is the psbt key that this signer uses to find pubnonces and
+    // partial signatures (PSBT_IN_MUSIG2_PUB_NONCE and PSBT_IN_MUSIG2_PARTIAL_SIG fields). The
+    // length is either 33+33 (keypath spend), or 33+33+32 bytes (tapscript spend). It's the
+    // concatenation of:
+    // - the 33-byte compressed pubkey of this participant
+    // - the 33-byte aggregate compressed pubkey (after all the tweaks)
+    // - (tapscript only) the 32-byte tapleaf hash
+    musig_my_psbt_id_key[0] = PSBT_IN_MUSIG2_PUB_NONCE;
+
+    uint8_t *musig_my_psbt_id = musig_my_psbt_id_key + 1;
+    size_t psbt_id_len = keyexpr_info->is_tapscript ? 33 + 33 + 32 : 33 + 33;
+    memcpy(musig_my_psbt_id, keyexpr_info->internal_pubkey.compressed_pubkey, 33);
+    memcpy(musig_my_psbt_id + 33, musig_per_input_info->agg_key_tweaked.compressed_pubkey, 33);
+    if (keyexpr_info->is_tapscript) {
+        memcpy(musig_my_psbt_id + 33 + 33, keyexpr_info->tapleaf_hash, 32);
+    }
+    // call_get_merkleized_map_value returns int (negative on error); cast the
+    // unsigned sizeof so the comparison doesn't trip UBSan's sign-change check.
+    if ((int) sizeof(musig_pubnonce_t) != call_get_merkleized_map_value(dc,
+                                                                        &input->in_out.map,
+                                                                        musig_my_psbt_id_key,
+                                                                        1 + psbt_id_len,
+                                                                        my_pubnonce->raw,
+                                                                        sizeof(musig_pubnonce_t))) {
+        PRINTF("Missing or erroneous pubnonce in PSBT\n");
+        return false;
+    }
+    *musig_my_psbt_id_key_len = 1 + psbt_id_len;
+    return true;
+}
+
+// Reads from the PSBT the pubnonces of all the cosigners for the input, and aggregates them. It
+// does not send a status word.
+static bool __attribute__((noinline)) aggregate_musig_pubnonces(
+    dispatcher_context_t *dc,
+    const keyexpr_info_t *keyexpr_info,
+    const input_info_t *input,
+    const musig_per_input_info_t *musig_per_input_info,
+    const uint8_t musig_my_psbt_id_key[static MUSIG_PSBT_ID_KEY_MAX_LEN],
+    size_t musig_my_psbt_id_key_len,
+    musig_pubnonce_t *aggnonce) {
+    const policy_node_keyexpr_t *key_expr = keyexpr_info->key_expression_ptr;
+    const musig_aggr_key_info_t *musig_info = key_expr->m.musig_info;
+
+    musig_pubnonce_t nonces[MAX_PUBKEYS_PER_MUSIG];
+
+    for (int i = 0; i < musig_info->n; i++) {
+        uint8_t musig_ith_psbt_id_key[MUSIG_PSBT_ID_KEY_MAX_LEN];
+        uint8_t *musig_ith_psbt_id = musig_ith_psbt_id_key + 1;
+        // copy from musig_my_psbt_id_key, but replace the corresponding pubkey
+        memcpy(musig_ith_psbt_id_key, musig_my_psbt_id_key, sizeof(musig_ith_psbt_id_key));
+        memcpy(musig_ith_psbt_id, musig_per_input_info->keys[i], sizeof(plain_pk_t));
+
+        if (sizeof(musig_pubnonce_t) != call_get_merkleized_map_value(dc,
+                                                                      &input->in_out.map,
+                                                                      musig_ith_psbt_id_key,
+                                                                      musig_my_psbt_id_key_len,
+                                                                      nonces[i].raw,
+                                                                      sizeof(musig_pubnonce_t))) {
+            PRINTF("Missing or incorrect pubnonce for a MuSig2 cosigner\n");
+            return false;
+        }
+    }
+
+    int res = musig_nonce_agg(nonces, musig_info->n, aggnonce);
+    if (res < 0) {
+        PRINTF("Musig aggregation failed; disruptive signer has index %d\n", -res - 1);
+        return false;
+    }
+    return true;
+}
+
+// Computes the partial signature for the input and yields it. The secnonce is always zeroed out.
+static bool __attribute__((noinline)) sign_musig_and_yield_partial_signature(
+    dispatcher_context_t *dc,
+    sign_psbt_state_t *st,
+    const keyexpr_info_t *keyexpr_info,
+    musig_per_input_info_t *musig_per_input_info,
+    unsigned int cur_input_index,
+    musig_pubnonce_t *aggnonce,
+    musig_secnonce_t *secnonce,
+    uint8_t sighash[static 32]) {
+    const policy_node_keyexpr_t *key_expr = keyexpr_info->key_expression_ptr;
+    const musig_aggr_key_info_t *musig_info = key_expr->m.musig_info;
+
+    cx_ecfp_private_key_t private_key = {0};
+    uint8_t psig[32];
+    bool err = false;
+    do {  // block executed once, only to allow safely breaking out on error
+
+        // derive secret key
+        uint32_t sign_path[MAX_BIP32_PATH_STEPS];
+
+        for (int i = 0; i < keyexpr_info->key_derivation_length; i++) {
+            sign_path[i] = keyexpr_info->key_derivation[i];
+        }
+        int sign_path_len = keyexpr_info->key_derivation_length;
+
+        if (bip32_derive_init_privkey_256(CX_CURVE_256K1,
+                                          sign_path,
+                                          sign_path_len,
+                                          &private_key,
+                                          NULL) != CX_OK) {
+            err = true;
+            break;
+        }
+
+        // Create partial signature
+        uint8_t *tweaks_ptrs[3] = {
+            musig_per_input_info->tweaks[0],
+            musig_per_input_info->tweaks[1],
+            musig_per_input_info->tweaks[2]  // the last element is ignored if n_tweaks == 2
+        };
+        musig_session_context_t musig_session_context = {.aggnonce = aggnonce,
+                                                         .n_keys = musig_info->n,
+                                                         .pubkeys = musig_per_input_info->keys,
+                                                         .n_tweaks = musig_per_input_info->n_tweaks,
+                                                         .tweaks = tweaks_ptrs,
+                                                         .is_xonly = musig_per_input_info->is_xonly,
+                                                         .msg = sighash,
+                                                         .msg_len = 32};
+
+        if (0 > musig_sign(secnonce, private_key.d, &musig_session_context, psig)) {
+            PRINTF("Musig2 signature failed\n");
+            err = true;
+            break;
+        }
+    } while (false);
+
+    explicit_bzero(&private_key, sizeof(private_key));
+    explicit_bzero(secnonce, sizeof(*secnonce));
+
+    if (err) {
+        PRINTF("Partial signature generation failed\n");
+        return false;
+    }
+
+    if (!yield_musig_partial_signature(
+            dc,
+            st,
+            cur_input_index,
+            psig,
+            keyexpr_info->internal_pubkey.compressed_pubkey,
+            musig_per_input_info->agg_key_tweaked.compressed_pubkey,
+            keyexpr_info->is_tapscript ? keyexpr_info->tapleaf_hash : NULL)) {
+        PRINTF("Failed yielding MuSig2 partial signature\n");
+        SEND_SW(dc, SW_BAD_STATE);  // should never happen
+        return false;
+    }
+
+    return true;
+}
+
 bool __attribute__((noinline)) sign_sighash_musig_and_yield(dispatcher_context_t *dc,
                                                             sign_psbt_state_t *st,
                                                             signing_state_t *signing_state,
@@ -388,34 +554,16 @@ bool __attribute__((noinline)) sign_sighash_musig_and_yield(dispatcher_context_t
     }
 
     // Find my pubnonce is in the psbt.
-    //
-    // Compute musig_my_psbt_id. It is the psbt key that this signer uses to find pubnonces and
-    // partial signatures (PSBT_IN_MUSIG2_PUB_NONCE and PSBT_IN_MUSIG2_PARTIAL_SIG fields). The
-    // length is either 33+33 (keypath spend), or 33+33+32 bytes (tapscript spend). It's the
-    // concatenation of:
-    // - the 33-byte compressed pubkey of this participant
-    // - the 33-byte aggregate compressed pubkey (after all the tweaks)
-    // - (tapscript only) the 32-byte tapleaf hash
-    uint8_t musig_my_psbt_id_key[1 + 33 + 33 + 32];
-    musig_my_psbt_id_key[0] = PSBT_IN_MUSIG2_PUB_NONCE;
-
-    uint8_t *musig_my_psbt_id = musig_my_psbt_id_key + 1;
-    size_t psbt_id_len = keyexpr_info->is_tapscript ? 33 + 33 + 32 : 33 + 33;
-    memcpy(musig_my_psbt_id, keyexpr_info->internal_pubkey.compressed_pubkey, 33);
-    memcpy(musig_my_psbt_id + 33, musig_per_input_info.agg_key_tweaked.compressed_pubkey, 33);
-    if (keyexpr_info->is_tapscript) {
-        memcpy(musig_my_psbt_id + 33 + 33, keyexpr_info->tapleaf_hash, 32);
-    }
+    uint8_t musig_my_psbt_id_key[MUSIG_PSBT_ID_KEY_MAX_LEN];
+    size_t musig_my_psbt_id_key_len;
     musig_pubnonce_t my_pubnonce;
-    // call_get_merkleized_map_value returns int (negative on error); cast the
-    // unsigned sizeof so the comparison doesn't trip UBSan's sign-change check.
-    if ((int) sizeof(musig_pubnonce_t) != call_get_merkleized_map_value(dc,
-                                                                        &input->in_out.map,
-                                                                        musig_my_psbt_id_key,
-                                                                        1 + psbt_id_len,
-                                                                        my_pubnonce.raw,
-                                                                        sizeof(musig_pubnonce_t))) {
-        PRINTF("Missing or erroneous pubnonce in PSBT\n");
+    if (!read_my_musig_pubnonce(dc,
+                                keyexpr_info,
+                                input,
+                                &musig_per_input_info,
+                                musig_my_psbt_id_key,
+                                &musig_my_psbt_id_key_len,
+                                &my_pubnonce)) {
         SEND_SW(dc, SW_INCORRECT_DATA);
         return false;
     }
@@ -438,37 +586,14 @@ bool __attribute__((noinline)) sign_sighash_musig_and_yield(dispatcher_context_t
         return false;
     }
 
-    // collect all pubnonces
-
-    const policy_node_keyexpr_t *key_expr = keyexpr_info->key_expression_ptr;
-    const musig_aggr_key_info_t *musig_info = key_expr->m.musig_info;
-
-    musig_pubnonce_t nonces[MAX_PUBKEYS_PER_MUSIG];
-
-    for (int i = 0; i < musig_info->n; i++) {
-        uint8_t musig_ith_psbt_id_key[1 + 33 + 33 + 32];
-        uint8_t *musig_ith_psbt_id = musig_ith_psbt_id_key + 1;
-        // copy from musig_my_psbt_id_key, but replace the corresponding pubkey
-        memcpy(musig_ith_psbt_id_key, musig_my_psbt_id_key, sizeof(musig_my_psbt_id_key));
-        memcpy(musig_ith_psbt_id, musig_per_input_info.keys[i], sizeof(plain_pk_t));
-
-        if (sizeof(musig_pubnonce_t) != call_get_merkleized_map_value(dc,
-                                                                      &input->in_out.map,
-                                                                      musig_ith_psbt_id_key,
-                                                                      1 + psbt_id_len,
-                                                                      nonces[i].raw,
-                                                                      sizeof(musig_pubnonce_t))) {
-            PRINTF("Missing or incorrect pubnonce for a MuSig2 cosigner\n");
-            SEND_SW(dc, SW_INCORRECT_DATA);
-            return false;
-        }
-    }
-
-    // compute aggregate nonce
     musig_pubnonce_t aggnonce;
-    int res = musig_nonce_agg(nonces, musig_info->n, &aggnonce);
-    if (res < 0) {
-        PRINTF("Musig aggregation failed; disruptive signer has index %d\n", -res - 1);
+    if (!aggregate_musig_pubnonces(dc,
+                                   keyexpr_info,
+                                   input,
+                                   &musig_per_input_info,
+                                   musig_my_psbt_id_key,
+                                   musig_my_psbt_id_key_len,
+                                   &aggnonce)) {
         SEND_SW(dc, SW_INCORRECT_DATA);
         return false;
     }
@@ -497,71 +622,12 @@ bool __attribute__((noinline)) sign_sighash_musig_and_yield(dispatcher_context_t
     }
 
     // generate and yield partial signature
-
-    cx_ecfp_private_key_t private_key = {0};
-    uint8_t psig[32];
-    bool err = false;
-    do {  // block executed once, only to allow safely breaking out on error
-
-        // derive secret key
-        uint32_t sign_path[MAX_BIP32_PATH_STEPS];
-
-        for (int i = 0; i < keyexpr_info->key_derivation_length; i++) {
-            sign_path[i] = keyexpr_info->key_derivation[i];
-        }
-        int sign_path_len = keyexpr_info->key_derivation_length;
-
-        if (bip32_derive_init_privkey_256(CX_CURVE_256K1,
-                                          sign_path,
-                                          sign_path_len,
-                                          &private_key,
-                                          NULL) != CX_OK) {
-            err = true;
-            break;
-        }
-
-        // Create partial signature
-        uint8_t *tweaks_ptrs[3] = {
-            musig_per_input_info.tweaks[0],
-            musig_per_input_info.tweaks[1],
-            musig_per_input_info.tweaks[2]  // the last element is ignored if n_tweaks == 2
-        };
-        musig_session_context_t musig_session_context = {.aggnonce = &aggnonce,
-                                                         .n_keys = musig_info->n,
-                                                         .pubkeys = musig_per_input_info.keys,
-                                                         .n_tweaks = musig_per_input_info.n_tweaks,
-                                                         .tweaks = tweaks_ptrs,
-                                                         .is_xonly = musig_per_input_info.is_xonly,
-                                                         .msg = sighash,
-                                                         .msg_len = 32};
-
-        if (0 > musig_sign(&secnonce, private_key.d, &musig_session_context, psig)) {
-            PRINTF("Musig2 signature failed\n");
-            err = true;
-            break;
-        }
-    } while (false);
-
-    explicit_bzero(&private_key, sizeof(private_key));
-    explicit_bzero(&secnonce, sizeof(secnonce));
-
-    if (err) {
-        PRINTF("Partial signature generation failed\n");
-        return false;
-    }
-
-    if (!yield_musig_partial_signature(
-            dc,
-            st,
-            cur_input_index,
-            psig,
-            keyexpr_info->internal_pubkey.compressed_pubkey,
-            musig_per_input_info.agg_key_tweaked.compressed_pubkey,
-            keyexpr_info->is_tapscript ? keyexpr_info->tapleaf_hash : NULL)) {
-        PRINTF("Failed yielding MuSig2 partial signature\n");
-        SEND_SW(dc, SW_BAD_STATE);  // should never happen
-        return false;
-    }
-
-    return true;
+    return sign_musig_and_yield_partial_signature(dc,
+                                                  st,
+                                                  keyexpr_info,
+                                                  &musig_per_input_info,
+                                                  cur_input_index,
+                                                  &aggnonce,
+                                                  &secnonce,
+                                                  sighash);
 }
