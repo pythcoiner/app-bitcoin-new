@@ -1,10 +1,14 @@
 from hashlib import sha256
 import hmac
-from typing import Tuple
+from pathlib import Path
+from typing import List, Tuple
 
 import pytest
 
 from ragger.error import ExceptionRAPDU
+from ragger.firmware import Firmware
+from ragger.firmware.touch.positions import STAX_X_CENTER, FLEX_X_CENTER, APEX_P_X_CENTER, STAX_BUTTON_LOWER_MIDDLE, FLEX_BUTTON_LOWER_MIDDLE, APEX_P_BUTTON_LOWER_MIDDLE
+from ragger.navigator import Navigator, NavInsID, NavIns
 
 from ledger_bitcoin import Musig2PrenonceBatch
 from ledger_bitcoin.key import ExtendedKey
@@ -30,6 +34,8 @@ EC_GET_MUSIG2_PRENONCES_J_NOT_AVAILABLE = 0x0004
 EC_ADVANCE_MUSIG2_PRENONCES_STATE_UNAVAILABLE = 0x0000
 
 PRENONCE_WINDOW_SIZE = 128
+
+tests_root: Path = Path(__file__).parent
 
 
 @pytest.fixture(autouse=True)
@@ -216,3 +222,58 @@ def test_musig2_prenonces_window(client: RaggerClient, speculos_globals: Speculo
     with pytest.raises(ExceptionRAPDU) as e:
         client.get_musig2_prenonces(wallet_policy, wallet_hmac, 9, 0, 0, 1)
     assert_refused(e.value, SW_INCORRECT_DATA, EC_GET_MUSIG2_PRENONCES_J_NOT_AVAILABLE)
+
+
+def reset_musig2_prenonces_instructions(firmware: Firmware, confirm: bool) -> List[NavIns]:
+    # opens the settings, selects the reset entry on the second settings page, then confirms or cancels
+    if firmware.device.startswith("nano"):
+        open_dialog = [NavInsID.RIGHT_CLICK, NavInsID.BOTH_CLICK, NavInsID.RIGHT_CLICK, NavInsID.BOTH_CLICK,
+                       NavInsID.RIGHT_CLICK, NavInsID.RIGHT_CLICK]
+        return open_dialog + ([NavInsID.BOTH_CLICK] if confirm else [NavInsID.RIGHT_CLICK, NavInsID.BOTH_CLICK])
+
+    # USE_CASE_CHOICE_REJECT misses the centered cancel button on apex_p, so it is touched directly
+    if firmware.device == "stax":
+        bar_pos, cancel_pos = (STAX_X_CENTER, 135), STAX_BUTTON_LOWER_MIDDLE
+    elif firmware.device == "flex":
+        bar_pos, cancel_pos = (FLEX_X_CENTER, 135), FLEX_BUTTON_LOWER_MIDDLE
+    else:  # apex_p, apex_m
+        bar_pos, cancel_pos = (APEX_P_X_CENTER, 90), APEX_P_BUTTON_LOWER_MIDDLE
+    return [
+        NavInsID.USE_CASE_HOME_SETTINGS,
+        NavInsID.USE_CASE_SETTINGS_NEXT,
+        NavIns(NavInsID.TOUCH, bar_pos),
+        NavInsID.USE_CASE_CHOICE_CONFIRM if confirm else NavIns(NavInsID.TOUCH, cancel_pos),
+    ]
+
+
+def test_musig2_prenonces_reset(navigator: Navigator, firmware: Firmware, client: RaggerClient, test_name: str,
+                                speculos_globals: SpeculosGlobals):
+    wallet_policy, wallet_hmac = keypath_wallet_policy(speculos_globals)
+
+    batch = client.get_musig2_prenonces(wallet_policy, wallet_hmac, 10, 0, 0, 2)
+    assert client.advance_musig2_prenonces(5) == 5
+
+    navigator.navigate_and_compare(tests_root, test_name,
+                                   reset_musig2_prenonces_instructions(firmware, True),
+                                   screen_change_before_first_instruction=False)
+
+    # the window is empty, and the same j gives other pubnonces
+    new_batch = client.get_musig2_prenonces(wallet_policy, wallet_hmac, 10, 0, 0, 2)
+    assert new_batch.hwm == 0
+    assert {pubnonce for _, pubnonce in new_batch.pubnonces}.isdisjoint(
+        {pubnonce for _, pubnonce in batch.pubnonces})
+    client.get_musig2_prenonces(wallet_policy, wallet_hmac, 0, 0, 0, 1)
+
+
+def test_musig2_prenonces_reset_cancel(navigator: Navigator, firmware: Firmware, client: RaggerClient,
+                                       speculos_globals: SpeculosGlobals):
+    wallet_policy, wallet_hmac = keypath_wallet_policy(speculos_globals)
+
+    batch = client.get_musig2_prenonces(wallet_policy, wallet_hmac, 10, 0, 0, 2)
+    assert client.advance_musig2_prenonces(5) == 5
+
+    navigator.navigate(reset_musig2_prenonces_instructions(firmware, False),
+                       screen_change_before_first_instruction=False)
+
+    assert client.get_musig2_prenonces(wallet_policy, wallet_hmac, 10, 0, 0, 2) == Musig2PrenonceBatch(
+        j=10, k=0, pk=batch.pk, agg_pk=batch.agg_pk, hwm=5, pubnonces=batch.pubnonces)
