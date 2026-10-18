@@ -8,19 +8,40 @@ from ragger.error import ExceptionRAPDU
 from ragger.firmware import Firmware
 from ragger.navigator import Navigator
 
-from ledger_bitcoin import Musig2PrenonceBatch
+from ledger_bitcoin import Musig2PrenonceBatch, MusigPartialSignature
+from ledger_bitcoin.client_command import ClientCommandCode, ClientCommandInterpreter
 from ledger_bitcoin.key import ExtendedKey
 from ledger_bitcoin.psbt import PSBT
 from ledger_bitcoin.wallet import WalletPolicy
 from ragger_bitcoin import RaggerClient
-from test_utils import SpeculosGlobals, txmaker
+from test_utils import SpeculosGlobals, bip0327, txmaker
+from test_utils.bip0322 import build_bip322_psbt
 from test_utils.musig2 import HotMusig2Cosigner, MuSig2KeyPlaceholder, TrDescriptorTemplate, aggregate_musig_pubkey, process_placeholder, run_musig2_test
 from test_utils.taproot_sighash import SIGHASH_DEFAULT, TaprootSignatureHash
 
 from .instructions import sign_psbt_instruction_approve
-from .test_sign_psbt_musig import KEYPATH_COSIGNER_2_XPRIV, KEYPATH_PSBT_B64, KEYPATH_SIGHASHES, SCRIPTPATH_COSIGNER_1_XPUB, SCRIPTPATH_COSIGNER_2_XPRIV, SCRIPTPATH_COSIGNER_2_XPUB, SCRIPTPATH_INTERNAL_XPUB, SCRIPTPATH_PSBT_B64, SCRIPTPATH_SIGHASHES, LedgerMusig2Cosigner, keypath_wallet_policy, musig_pubnonce_ids, scriptpath_wallet_policy
+from .test_sign_psbt_musig import KEYPATH_COSIGNER_1_XPUB, KEYPATH_COSIGNER_2_XPRIV, KEYPATH_COSIGNER_2_XPUB, KEYPATH_PSBT_B64, KEYPATH_SIGHASHES, SCRIPTPATH_COSIGNER_1_XPUB, SCRIPTPATH_COSIGNER_2_XPRIV, SCRIPTPATH_COSIGNER_2_XPUB, SCRIPTPATH_INTERNAL_XPUB, SCRIPTPATH_PSBT_B64, SCRIPTPATH_SIGHASHES, LedgerMusig2Cosigner, keypath_wallet_policy, musig_pubnonce_ids, scriptpath_wallet_policy
 
+SW_INCORRECT_DATA = 0x6A80
+SW_NOT_SUPPORTED = 0x6A82
 SW_INS_NOT_SUPPORTED = 0x6D00
+SW_BAD_STATE = 0xB007
+
+# Error codes from error_codes.h
+EC_SIGN_PSBT_MUSIG2_PRENONCE_MALFORMED_J = 0x0016
+EC_SIGN_PSBT_MUSIG2_PRENONCE_INCONSISTENT_J = 0x0017
+EC_SIGN_PSBT_MUSIG2_PRENONCE_NOT_ALLOWED = 0x0018
+EC_SIGN_PSBT_MUSIG2_PRENONCE_NO_PUBNONCES = 0x0019
+EC_SIGN_PSBT_MUSIG2_PRENONCE_STATE_UNAVAILABLE = 0x001a
+EC_SIGN_PSBT_MUSIG2_PRENONCE_J_NOT_AVAILABLE = 0x001b
+EC_SIGN_PSBT_MUSIG2_PRENONCE_MISSING_PUBNONCE = 0x001c
+EC_SIGN_PSBT_MUSIG2_PRENONCE_PUBNONCE_MISMATCH = 0x001d
+EC_SIGN_PSBT_MUSIG2_PRENONCE_COSIGNER_PUBNONCE = 0x001e
+
+PRENONCE_WINDOW_SIZE = 128
+
+# another key of the device, used in a second musig()
+OTHER_INTERNAL_XPUB = "[f5acc2fd/48'/1'/0'/2']tpubDFAqEGNyad35aBCKUAXbQGDjdVhNueno5ZZVEn3sQbW5ci457gLR7HyTmHBg93oourBssgUxuWz1jX5uhc1qaqFo9VsybY1J5FuedLfm4dK"
 
 
 @pytest.fixture(autouse=True)
@@ -171,3 +192,272 @@ def test_sign_psbt_musig2_prenonces_two_musig_in_leaf(navigator: Navigator, firm
     signer_2 = HotMusig2Cosigner(wallet_policy, SCRIPTPATH_COSIGNER_2_XPRIV)
 
     run_musig2_test(wallet_policy, psbt, [signer_1, signer_2], compute_sighashes(wallet_policy, psbt))
+
+
+def assert_refused(e: ExceptionRAPDU, status: int, error_code: int):
+    assert e.status == status
+    assert e.data == error_code.to_bytes(2, 'big')
+
+
+@pytest.fixture
+def client_requests(monkeypatch) -> List[bytes]:
+    # records every client command requested by the device
+    requests: List[bytes] = []
+    execute = ClientCommandInterpreter.execute
+
+    def recording_execute(self, hw_response: bytes) -> bytes:
+        requests.append(hw_response)
+        return execute(self, hw_response)
+
+    monkeypatch.setattr(ClientCommandInterpreter, "execute", recording_execute)
+    return requests
+
+
+def assert_nothing_yielded(client_requests: List[bytes]) -> None:
+    assert all(request[0] != ClientCommandCode.YIELD for request in client_requests)
+
+
+def prenonce_psbt(client: RaggerClient, wallet_policy: WalletPolicy, wallet_hmac: bytes, psbt: PSBT, j: int,
+                  cosigner_xpriv: str) -> Tuple[PSBT, List[Musig2PrenonceBatch]]:
+    # the psbt with our batch j and the pubnonces of the hot cosigner, ready for a one-round signing
+    pubkey = LedgerMusig2Cosigner(client, wallet_policy, wallet_hmac).pubkey.pubkey
+    batches = get_prenonce_batches(client, wallet_policy, wallet_hmac, pubkey, j, len(psbt.inputs))
+    place_prenonces(wallet_policy, psbt, batches)
+    HotMusig2Cosigner(wallet_policy, cosigner_xpriv).generate_public_nonces(psbt)
+    return psbt, batches
+
+
+def keypath_psbt() -> PSBT:
+    psbt = PSBT()
+    psbt.deserialize(KEYPATH_PSBT_B64)
+    return psbt
+
+
+def other_keypath_psbt() -> PSBT:
+    # another transaction from the same wallet policy and the same input address
+    psbt = keypath_psbt()
+    psbt.tx.vout[0].nValue += 1000
+    psbt.tx.rehash()
+    return psbt
+
+
+def expect_refused(client: RaggerClient, wallet_policy: WalletPolicy, wallet_hmac: bytes, psbt: PSBT,
+                   client_requests: List[bytes], status: int, error_code: int) -> None:
+    # the device refuses before the review, without yielding anything
+    client_requests.clear()
+    with pytest.raises(ExceptionRAPDU) as e:
+        client.sign_psbt(psbt, wallet_policy, wallet_hmac)
+    assert_refused(e.value, status, error_code)
+    assert_nothing_yielded(client_requests)
+
+
+def replace_own_pubnonces(psbt: PSBT, pubkey: bytes, rand_: bytes) -> None:
+    # replaces our pubnonces with different, but still valid, ones
+    n_replaced = 0
+    for input in psbt.inputs:
+        for psbt_key in input.musig2_pub_nonces.keys():
+            if psbt_key[0] != pubkey:
+                continue
+            _, other_pubnonce = bip0327.nonce_gen_internal(
+                rand_=rand_, sk=None, pk=pubkey, aggpk=None, msg=None, extra_in=None)
+            input.musig2_pub_nonces[psbt_key] = other_pubnonce
+            n_replaced += 1
+    assert n_replaced > 0
+
+
+def test_sign_psbt_musig2_prenonces_same_j_twice(navigator: Navigator, firmware: Firmware, client: RaggerClient,
+                                                 test_name: str, speculos_globals: SpeculosGlobals,
+                                                 client_requests: List[bytes]):
+    wallet_policy, wallet_hmac = keypath_wallet_policy(speculos_globals)
+
+    psbt, batches = prenonce_psbt(client, wallet_policy, wallet_hmac, keypath_psbt(), 0, KEYPATH_COSIGNER_2_XPRIV)
+    result = client.sign_psbt(psbt, wallet_policy, wallet_hmac, navigator, testname=test_name,
+                              instructions=sign_psbt_instruction_approve(
+                                  firmware, save_screenshot=False, has_spend_from_wallet=True, has_feewarning=True))
+    assert len(result) == 1 and isinstance(result[0][1], MusigPartialSignature)
+
+    # the coordinator reuses the same batch on another transaction
+    other_psbt = other_keypath_psbt()
+    place_prenonces(wallet_policy, other_psbt, batches)
+    HotMusig2Cosigner(wallet_policy, KEYPATH_COSIGNER_2_XPRIV).generate_public_nonces(other_psbt)
+    expect_refused(client, wallet_policy, wallet_hmac, other_psbt, client_requests,
+                   SW_INCORRECT_DATA, EC_SIGN_PSBT_MUSIG2_PRENONCE_J_NOT_AVAILABLE)
+
+    # the same transaction again is refused as well
+    expect_refused(client, wallet_policy, wallet_hmac, psbt, client_requests,
+                   SW_INCORRECT_DATA, EC_SIGN_PSBT_MUSIG2_PRENONCE_J_NOT_AVAILABLE)
+
+
+def test_sign_psbt_musig2_prenonces_j_below_hwm(client: RaggerClient, speculos_globals: SpeculosGlobals,
+                                                client_requests: List[bytes]):
+    wallet_policy, wallet_hmac = keypath_wallet_policy(speculos_globals)
+
+    psbt, _ = prenonce_psbt(client, wallet_policy, wallet_hmac, keypath_psbt(), 3, KEYPATH_COSIGNER_2_XPRIV)
+    assert client.advance_musig2_prenonces(4) == 4
+
+    expect_refused(client, wallet_policy, wallet_hmac, psbt, client_requests,
+                   SW_INCORRECT_DATA, EC_SIGN_PSBT_MUSIG2_PRENONCE_J_NOT_AVAILABLE)
+
+
+def test_sign_psbt_musig2_prenonces_j_beyond_window(client: RaggerClient, speculos_globals: SpeculosGlobals,
+                                                    client_requests: List[bytes]):
+    wallet_policy, wallet_hmac = keypath_wallet_policy(speculos_globals)
+
+    psbt, batches = prenonce_psbt(client, wallet_policy, wallet_hmac, keypath_psbt(), 0, KEYPATH_COSIGNER_2_XPRIV)
+    psbt.set_musig2_prenonce_j(batches[0].pk, PRENONCE_WINDOW_SIZE)
+
+    expect_refused(client, wallet_policy, wallet_hmac, psbt, client_requests,
+                   SW_INCORRECT_DATA, EC_SIGN_PSBT_MUSIG2_PRENONCE_J_NOT_AVAILABLE)
+
+
+def test_sign_psbt_musig2_prenonces_other_wallet(client: RaggerClient, speculos_globals: SpeculosGlobals,
+                                                 client_requests: List[bytes]):
+    wallet_policy, wallet_hmac = keypath_wallet_policy(speculos_globals)
+
+    # same keys and same addresses, but a different wallet policy
+    other_wallet_policy, other_wallet_hmac = register(speculos_globals, WalletPolicy(
+        name="Musig for my other ears",
+        descriptor_template="tr(musig(@1,@0)/**)",
+        keys_info=wallet_policy.keys_info
+    ))
+
+    psbt, _ = prenonce_psbt(client, wallet_policy, wallet_hmac, keypath_psbt(), 0, KEYPATH_COSIGNER_2_XPRIV)
+
+    expect_refused(client, other_wallet_policy, other_wallet_hmac, psbt, client_requests,
+                   SW_INCORRECT_DATA, EC_SIGN_PSBT_MUSIG2_PRENONCE_PUBNONCE_MISMATCH)
+
+
+def test_sign_psbt_musig2_prenonces_moved_pubnonce(client: RaggerClient, speculos_globals: SpeculosGlobals,
+                                                   client_requests: List[bytes]):
+    wallet_policy, wallet_hmac = keypath_wallet_policy(speculos_globals)
+
+    psbt = txmaker.createPsbt(wallet_policy, [100_000, 200_000], [250_000], [False])
+    psbt, batches = prenonce_psbt(client, wallet_policy, wallet_hmac, psbt, 0, KEYPATH_COSIGNER_2_XPRIV)
+
+    # our pubnonces of the two input positions are swapped
+    ids = musig_pubnonce_ids(wallet_policy, psbt)
+    key_0 = (batches[0].pk, *ids[(0, 0)])
+    key_1 = (batches[0].pk, *ids[(1, 0)])
+    pubnonces = psbt.inputs[0].musig2_pub_nonces
+    other_pubnonces = psbt.inputs[1].musig2_pub_nonces
+    pubnonces[key_0], other_pubnonces[key_1] = other_pubnonces[key_1], pubnonces[key_0]
+
+    expect_refused(client, wallet_policy, wallet_hmac, psbt, client_requests,
+                   SW_INCORRECT_DATA, EC_SIGN_PSBT_MUSIG2_PRENONCE_PUBNONCE_MISMATCH)
+
+
+def test_sign_psbt_musig2_prenonces_tampered_pubnonce(client: RaggerClient, speculos_globals: SpeculosGlobals,
+                                                      client_requests: List[bytes]):
+    wallet_policy, wallet_hmac = keypath_wallet_policy(speculos_globals)
+
+    psbt, batches = prenonce_psbt(client, wallet_policy, wallet_hmac, keypath_psbt(), 0, KEYPATH_COSIGNER_2_XPRIV)
+    replace_own_pubnonces(psbt, batches[0].pk, b'\x42' * 32)
+
+    expect_refused(client, wallet_policy, wallet_hmac, psbt, client_requests,
+                   SW_INCORRECT_DATA, EC_SIGN_PSBT_MUSIG2_PRENONCE_PUBNONCE_MISMATCH)
+
+
+def test_sign_psbt_musig2_prenonces_missing_cosigner_pubnonce(client: RaggerClient,
+                                                              speculos_globals: SpeculosGlobals,
+                                                              client_requests: List[bytes]):
+    wallet_policy, wallet_hmac = keypath_wallet_policy(speculos_globals)
+
+    psbt, batches = prenonce_psbt(client, wallet_policy, wallet_hmac, keypath_psbt(), 0, KEYPATH_COSIGNER_2_XPRIV)
+    pubnonces = psbt.inputs[0].musig2_pub_nonces
+    for psbt_key in [psbt_key for psbt_key in pubnonces if psbt_key[0] != batches[0].pk]:
+        del pubnonces[psbt_key]
+    assert len(pubnonces) == 1
+
+    expect_refused(client, wallet_policy, wallet_hmac, psbt, client_requests,
+                   SW_INCORRECT_DATA, EC_SIGN_PSBT_MUSIG2_PRENONCE_COSIGNER_PUBNONCE)
+
+
+def test_sign_psbt_musig2_prenonces_mixed(client: RaggerClient, speculos_globals: SpeculosGlobals,
+                                          client_requests: List[bytes]):
+    wallet_policy, wallet_hmac = keypath_wallet_policy(speculos_globals)
+
+    psbt = txmaker.createPsbt(wallet_policy, [100_000, 200_000], [250_000], [False])
+    psbt, batches = prenonce_psbt(client, wallet_policy, wallet_hmac, psbt, 0, KEYPATH_COSIGNER_2_XPRIV)
+
+    # the second input has no pubnonce of ours
+    ids = musig_pubnonce_ids(wallet_policy, psbt)
+    del psbt.inputs[1].musig2_pub_nonces[(batches[0].pk, *ids[(1, 0)])]
+
+    expect_refused(client, wallet_policy, wallet_hmac, psbt, client_requests,
+                   SW_INCORRECT_DATA, EC_SIGN_PSBT_MUSIG2_PRENONCE_MISSING_PUBNONCE)
+
+
+def test_sign_psbt_musig2_prenonces_inconsistent_j(client: RaggerClient, speculos_globals: SpeculosGlobals,
+                                                   client_requests: List[bytes]):
+    # two musig() key expressions, each with a different key of ours
+    wallet_policy, wallet_hmac = register(speculos_globals, WalletPolicy(
+        name="Two keys of ours",
+        descriptor_template="tr(@0/**,{pk(musig(@1,@2)/**),pk(musig(@3,@2)/<2;3>/*)})",
+        keys_info=[SCRIPTPATH_INTERNAL_XPUB, KEYPATH_COSIGNER_1_XPUB, KEYPATH_COSIGNER_2_XPUB, OTHER_INTERNAL_XPUB]
+    ))
+    pubkey = LedgerMusig2Cosigner(client, wallet_policy, wallet_hmac).pubkey.pubkey
+
+    psbt = txmaker.createPsbt(wallet_policy, [100_000], [50_000], [False])
+
+    # only the first musig() gets its pubnonces and j
+    batch = client.get_musig2_prenonces(wallet_policy, wallet_hmac, 0, 1, 0, 1)
+    assert batch.pk == pubkey
+    place_prenonces(wallet_policy, psbt, [batch])
+    HotMusig2Cosigner(wallet_policy, KEYPATH_COSIGNER_2_XPRIV).generate_public_nonces(psbt)
+
+    expect_refused(client, wallet_policy, wallet_hmac, psbt, client_requests,
+                   SW_INCORRECT_DATA, EC_SIGN_PSBT_MUSIG2_PRENONCE_INCONSISTENT_J)
+
+
+def test_sign_psbt_musig2_prenonces_malformed_j(client: RaggerClient, speculos_globals: SpeculosGlobals,
+                                                client_requests: List[bytes]):
+    wallet_policy, wallet_hmac = keypath_wallet_policy(speculos_globals)
+
+    psbt, batches = prenonce_psbt(client, wallet_policy, wallet_hmac, keypath_psbt(), 0, KEYPATH_COSIGNER_2_XPRIV)
+    j_key = next(key for key in psbt.unknown if key.endswith(batches[0].pk))
+    for value in [b'', b'\x00' * 3, b'\x00' * 5]:
+        psbt.unknown[j_key] = value
+        expect_refused(client, wallet_policy, wallet_hmac, psbt, client_requests,
+                       SW_INCORRECT_DATA, EC_SIGN_PSBT_MUSIG2_PRENONCE_MALFORMED_J)
+
+
+def test_sign_psbt_musig2_prenonces_no_pubnonces(client: RaggerClient, speculos_globals: SpeculosGlobals,
+                                                 client_requests: List[bytes]):
+    wallet_policy, wallet_hmac = keypath_wallet_policy(speculos_globals)
+    pubkey = LedgerMusig2Cosigner(client, wallet_policy, wallet_hmac).pubkey.pubkey
+
+    psbt = keypath_psbt()
+    psbt.set_musig2_prenonce_j(pubkey, 0)
+
+    expect_refused(client, wallet_policy, wallet_hmac, psbt, client_requests,
+                   SW_INCORRECT_DATA, EC_SIGN_PSBT_MUSIG2_PRENONCE_NO_PUBNONCES)
+
+
+def test_sign_psbt_musig2_prenonces_bip322(client: RaggerClient, speculos_globals: SpeculosGlobals,
+                                           client_requests: List[bytes]):
+    wallet_policy, wallet_hmac = keypath_wallet_policy(speculos_globals)
+
+    psbt = build_bip322_psbt(wallet_policy, b"I control this musig address")
+    psbt, _ = prenonce_psbt(client, wallet_policy, wallet_hmac, psbt, 0, KEYPATH_COSIGNER_2_XPRIV)
+
+    expect_refused(client, wallet_policy, wallet_hmac, psbt, client_requests,
+                   SW_NOT_SUPPORTED, EC_SIGN_PSBT_MUSIG2_PRENONCE_NOT_ALLOWED)
+
+
+def test_sign_psbt_musig2_prenonces_no_state(client: RaggerClient, speculos_globals: SpeculosGlobals,
+                                             client_requests: List[bytes]):
+    # signing never creates the state: a j field before any GET is refused
+    wallet_policy, wallet_hmac = keypath_wallet_policy(speculos_globals)
+    pubkey = LedgerMusig2Cosigner(client, wallet_policy, wallet_hmac).pubkey.pubkey
+
+    psbt = keypath_psbt()
+    HotMusig2Cosigner(wallet_policy, KEYPATH_COSIGNER_2_XPRIV).generate_public_nonces(psbt)
+    psbt.set_musig2_prenonce_j(pubkey, 0)
+
+    expect_refused(client, wallet_policy, wallet_hmac, psbt, client_requests,
+                   SW_BAD_STATE, EC_SIGN_PSBT_MUSIG2_PRENONCE_STATE_UNAVAILABLE)
+
+    # it is still not created
+    with pytest.raises(ExceptionRAPDU) as e:
+        client.advance_musig2_prenonces(0)
+    assert e.value.status == SW_BAD_STATE
