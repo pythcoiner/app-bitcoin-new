@@ -349,6 +349,14 @@ if(SPECULOS AND SPECULOS_SRC)
   target_link_libraries(test_musig PRIVATE cmocka app_crypto)
   add_test(test_musig test_musig)
 
+  # test_prenonce_storage exercises src/musig/prenonce_storage.c with the slots in RAM and an
+  # nvm_write mock that cuts writes at any byte.
+  add_executable(test_prenonce_storage test_prenonce_storage.c ../src/musig/prenonce_storage.c)
+  app_apply_real_sdk_config(test_prenonce_storage)
+  target_compile_definitions(test_prenonce_storage PRIVATE HAVE_MUSIG2_PRENONCES SKIP_FOR_CMOCKA)
+  target_link_libraries(test_prenonce_storage PRIVATE cmocka app_crypto prenonce_window)
+  add_test(test_prenonce_storage test_prenonce_storage)
+
   # test_sighash exercises classify_sighash (src/common/sighash.h), which only
   # depends on constants.h (and therefore the real SDK headers). No app object
   # code or syscalls are needed, so it just links cmocka.

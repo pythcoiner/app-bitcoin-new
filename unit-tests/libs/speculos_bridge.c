@@ -631,6 +631,10 @@ unsigned long sys_cx_rng(uint8_t *buffer, unsigned int length) {
     return (unsigned long) buffer;
 }
 
+cx_err_t cx_get_random_bytes(void *buffer, size_t len) {
+    return sys_cx_get_random_bytes(buffer, len);
+}
+
 /* The SDK's PIC() macro forwards to a `pic()` function that on the device
  * translates a link-time address into the runtime address used after the
  * loader has applied the application's relocations. On the host we run a

@@ -193,6 +193,12 @@ ifneq ($(AUTOAPPROVE_FOR_PERF_TESTS),0)
     endif
 endif
 
+# If set, the app supports one-round MuSig2 signing with pre-issued nonces.
+MUSIG2_PRENONCES ?= 0
+ifneq ($(MUSIG2_PRENONCES),0)
+    DEFINES += HAVE_MUSIG2_PRENONCES
+endif
+
 # DEFINES   += HAVE_PRINT_STACK_POINTER
 
 ifeq ($(DEBUG),10)
