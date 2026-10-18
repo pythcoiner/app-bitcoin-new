@@ -19,6 +19,8 @@ The main commands use `CLA = 0xE1`, unlike the legacy Bitcoin application that u
 |  E1 |  03 | GET_WALLET_ADDRESS     | Return and show on screen an address for a registered or default wallet |
 |  E1 |  04 | SIGN_PSBT              | Sign a PSBT with a registered or default wallet |
 |  E1 |  05 | GET_MASTER_FINGERPRINT | Return the fingerprint of the master public key |
+|  E1 |  06 | GET_MUSIG2_PRENONCES   | Return pre-issued MuSig2 pubnonces for a registered wallet (only with `MUSIG2_PRENONCES=1`) |
+|  E1 |  07 | ADVANCE_MUSIG2_PRENONCES | Raise the high-water mark of the pre-nonce window (only with `MUSIG2_PRENONCES=1`) |
 |  E1 |  10 | SIGN_MESSAGE           | Sign a message with a key from a BIP32 path (Bitcoin Message Signing) |
 
 The `CLA = 0xF8` is used for framework-specific (rather than app-specific) APDUs; at this time, only one command is present.
@@ -55,6 +57,8 @@ Once the user approves, the `REGISTER_WALLET` returns to the client a 32-byte HM
 | SW     | SW name                      | Description |
 |--------|------------------------------|-------------|
 | 0x6985 | `SW_DENY`                    | Rejected by user |
+| 0x6A80 | `SW_INCORRECT_DATA`          | Incorrect data |
+| 0x6A82 | `SW_NOT_SUPPORTED`           | Request not supported |
 | 0x6A86 | `SW_WRONG_P1P2`              | Either `P1` or `P2` is incorrect |
 | 0x6A87 | `SW_WRONG_DATA_LENGTH`       | `Lc` or minimum APDU length is incorrect |
 | 0x6D00 | `SW_INS_NOT_SUPPORTED`       | No command exists with `INS` |
@@ -279,6 +283,29 @@ The signatures are yielded exactly as for a regular transaction; the client is r
 
 As an optimization for proofs of funds, BIP-322 allows omitting the non-witness UTXO of an input that spends an output of the same transaction as an earlier input. This optimization is **not supported**: each input is authenticated on its own, exactly as in a regular `SIGN_PSBT`, so a legacy input without its non-witness UTXO is rejected, and a segwitv0 input without it triggers the missing non-witness UTXO warning. Clients should therefore include the non-witness UTXO in every input, even when it repeats the one of an earlier input.
 
+#### One-round MuSig2 with pre-issued nonces
+
+Only when the app is built with `MUSIG2_PRENONCES=1`. See [DESIGN.md](../DESIGN.md).
+
+If the global map has the proprietary field `0xFC || 0x0F || "MUSIG2_PRENONCE" || 0x00 || pk`, where `pk` is the 33-byte participant key of the device in the `musig()` key expressions it signs, the PSBT is a one-round request. The value is the 4-byte big-endian index `j` of a batch returned by `GET_MUSIG2_PRENONCES`; all the `musig()` key expressions the device signs must have the same `j`.
+
+Before the review, for each internal input and each `musig()` key expression, the device recomputes its pubnonce of the batch `j` for that input position, checks that it equals its `PSBT_IN_MUSIG2_PUB_NONCE`, and checks the pubnonces of all the cosigners. After the approval, `j` is consumed in NVRAM; then the partial signatures are yielded with the tag `0xFFFFFFFE`, as in round 2. Each `j` can be used by one signing only. Rejecting the transaction consumes nothing.
+
+The one-round mode is not allowed from the Exchange app (swap) nor for BIP-322. Specific error codes (from `error_codes.h`), sent after the status word:
+
+| SW | Error code | Name | Meaning |
+|----|------------|------|---------|
+| 0x6A80 | 0x0016 | `EC_SIGN_PSBT_MUSIG2_PRENONCE_MALFORMED_J` | The `j` field of our key is not 4 bytes |
+| 0x6A80 | 0x0017 | `EC_SIGN_PSBT_MUSIG2_PRENONCE_INCONSISTENT_J` | Our `musig()` key expressions do not all have the same `j` |
+| 0x6A82 | 0x0018 | `EC_SIGN_PSBT_MUSIG2_PRENONCE_NOT_ALLOWED` | Swap or BIP-322 |
+| 0x6A80 | 0x0019 | `EC_SIGN_PSBT_MUSIG2_PRENONCE_NO_PUBNONCES` | The PSBT has no MuSig2 pubnonce |
+| 0xB007 | 0x001A | `EC_SIGN_PSBT_MUSIG2_PRENONCE_STATE_UNAVAILABLE` | No pre-nonce state on the device |
+| 0x6A80 | 0x001B | `EC_SIGN_PSBT_MUSIG2_PRENONCE_J_NOT_AVAILABLE` | `j` is below the high-water mark, beyond the window, or consumed |
+| 0x6A80 | 0x001C | `EC_SIGN_PSBT_MUSIG2_PRENONCE_MISSING_PUBNONCE` | Our pubnonce is missing for a pair we sign (this includes a PSBT mixing one-round and two-round for our key) |
+| 0x6A80 | 0x001D | `EC_SIGN_PSBT_MUSIG2_PRENONCE_PUBNONCE_MISMATCH` | Our pubnonce is not the one of `j` for this wallet, input position and key expression |
+| 0x6A80 | 0x001E | `EC_SIGN_PSBT_MUSIG2_PRENONCE_COSIGNER_PUBNONCE` | A cosigner pubnonce is missing or invalid |
+| 0xB007 | 0x001F | `EC_SIGN_PSBT_MUSIG2_PRENONCE_COMMIT_FAILED` | `j` could not be consumed after the approval; no partial signature was produced |
+
 #### Client commands
 
 `GET_PREIMAGE` must know and respond for the full serialized wallet policy whose sha256 hash is `wallet_id`; moreover, it must know and respond for the sha256 hash of its descriptor template.
@@ -317,6 +344,105 @@ The fingerprint is necessary to fill the key origin information for some PSBT fi
 
 User interaction is not required for this command.
 
+### GET_MUSIG2_PRENONCES
+
+Returns the pubnonces of the batch `j` for a `musig()` key expression of a registered wallet policy, for a range of input positions, so that a later `SIGN_PSBT` can sign in a single call (see [One-round MuSig2 with pre-issued nonces](#one-round-musig2-with-pre-issued-nonces)).
+
+Only when the app is built with `MUSIG2_PRENONCES=1`; otherwise the command returns `SW_INS_NOT_SUPPORTED`.
+
+#### Encoding
+
+**Command**
+
+| *CLA* | *INS* |
+|-------|-------|
+| E1    | 06    |
+
+**Input data**
+
+| Length  | Name            | Description |
+|---------|-----------------|-------------|
+| `32`    | `wallet_id`     | The id of the wallet |
+| `32`    | `wallet_hmac`   | The hmac of the registered wallet |
+| `4`     | `j`             | The index of the batch (big-endian) |
+| `<var>` | `keyexpr_index` | The index of the `musig()` key expression in the descriptor template (Bitcoin-style varint) |
+| `4`     | `input_start`   | The first input position (big-endian) |
+| `1`     | `input_count`   | The number of input positions, from 1 to 32 |
+
+**Output data**
+
+| Length | Description |
+|--------|-------------|
+| `33`   | `pk`, the participant key of the device in the `musig()` |
+| `33`   | `agg_pk`, the aggregate key of the `musig()`, before any tweak |
+| `4`    | `hwm`, the high-water mark of the pre-nonce window (big-endian) |
+
+The pubnonces are returned with the YIELD client command, one per input position, in order: `<i: 4 bytes, big-endian> <pubnonce: 66 bytes>`.
+
+#### Description
+
+The wallet policy must be registered, be a `tr()` policy, and the key expression at `keyexpr_index` must be a `musig()` with a key of the device. The index counts every key expression of the descriptor template from left to right, starting at 0, without deduplication.
+
+`j` must be at least `hwm`, below `hwm + 128`, and not consumed. The same request always returns the same pubnonces. The pubnonces depend on the wallet, the key expression, `j` and the input position, not on the transaction. The coordinator places each of them in the PSBT under the `PSBT_IN_MUSIG2_PUB_NONCE` key computed for the actual input.
+
+The first call creates the secret the pubnonces are derived from, which is the only write to the device's storage done by this command. The secret is regenerated only from the settings menu, which makes all the issued pubnonces unusable; it is also lost on app or OS update.
+
+User interaction is not required for this command.
+
+| SW | Error code | Name | Meaning |
+|----|------------|------|---------|
+| 0x6A80 | 0x0000 | `EC_GET_MUSIG2_PRENONCES_MISSING_HMAC` | The wallet policy is not registered |
+| 0x6A82 | 0x0001 | `EC_GET_MUSIG2_PRENONCES_NOT_TAPROOT` | The wallet policy is not a `tr()` policy |
+| 0x6A80 | 0x0002 | `EC_GET_MUSIG2_PRENONCES_NOT_INTERNAL_MUSIG` | No `musig()` with a key of the device at `keyexpr_index` |
+| 0x6A80 | 0x0003 | `EC_GET_MUSIG2_PRENONCES_INVALID_INPUT_RANGE` | `input_count` out of range, or the range of positions overflows |
+| 0x6A80 | 0x0004 | `EC_GET_MUSIG2_PRENONCES_J_NOT_AVAILABLE` | `j` is below the high-water mark, beyond the window, or consumed |
+| 0xB007 | 0x0005 | `EC_GET_MUSIG2_PRENONCES_STATE_UNAVAILABLE` | The pre-nonce state could not be loaded or created |
+
+A wrong hmac returns `SW_SIGNATURE_FAIL`.
+
+#### Client commands
+
+`GET_PREIMAGE` must know and respond for the full serialized wallet policy whose sha256 hash is `wallet_id`; moreover, it must know and respond for the sha256 hash of its descriptor template.
+
+The client must respond to the `GET_PREIMAGE`, `GET_MERKLE_LEAF_PROOF` and `GET_MERKLE_LEAF_INDEX` queries for the Merkle tree of the list of keys of the wallet policy.
+
+The `YIELD` command must be processed in order to receive the pubnonces.
+
+### ADVANCE_MUSIG2_PRENONCES
+
+Raises the high-water mark of the pre-nonce window, consuming every batch `j` below it, so that an issued and abandoned batch does not block the window.
+
+Only when the app is built with `MUSIG2_PRENONCES=1`; otherwise the command returns `SW_INS_NOT_SUPPORTED`.
+
+#### Encoding
+
+**Command**
+
+| *CLA* | *INS* |
+|-------|-------|
+| E1    | 07    |
+
+**Input data**
+
+| Length | Name      | Description |
+|--------|-----------|-------------|
+| `4`    | `new_hwm` | The new high-water mark (big-endian) |
+
+**Output data**
+
+| Length | Description |
+|--------|-------------|
+| `4`    | The high-water mark after the command (big-endian) |
+
+#### Description
+
+The high-water mark becomes the maximum of its current value and `new_hwm`. A lower or equal value changes nothing, and can be used to read the current high-water mark. The command only makes the state stricter, so it requires no user interaction. A high-water mark of `0xFFFFFFFF` leaves no usable batch until the secret is regenerated from the settings menu.
+
+| SW | Error code | Name | Meaning |
+|----|------------|------|---------|
+| 0xB007 | 0x0000 | `EC_ADVANCE_MUSIG2_PRENONCES_STATE_UNAVAILABLE` | No pre-nonce state: no batch was ever issued |
+
+`SW_BAD_STATE` without error code means that the new state could not be written.
 
 ### SIGN_MESSAGE
 

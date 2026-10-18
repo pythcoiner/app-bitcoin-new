@@ -14,6 +14,10 @@ MuSig2 is a 2-round multi-signature scheme compatible with the public keys and s
 - The pubnonces can be generated before the transaction is known, and then used for a different transaction than the one given to the device in round 1 (see [below](#pre-generating-the-pubnonces)).
 - Only `musig(...)/**` or `musig(...)/<M;N>/*` key expressions are supported; the public keys must be xpubs aggregated without any further derivation. Schemes where each pubkey is derived prior to aggregation (for example descriptors similar to `musig(xpub1/<0;1>/*,xpub2/<0;1>/*,...)`) are not supported.
 
+## One-round signing with pre-issued nonces
+
+When the app is built with `MUSIG2_PRENONCES=1`, the device can also hand out pubnonces in batches with `GET_MUSIG2_PRENONCES`, for any number of future transactions, and sign a PSBT carrying them in a single `SIGN_PSBT` call. Each batch can be used by one signing only; the device keeps the consumed batches in NVRAM. This flow does not use the sessions described below, and does not affect them. See [DESIGN.md](../DESIGN.md) and the commands in [bitcoin.md](bitcoin.md).
+
 ## State minimization
 
 This section describes implementation details that allow to minimize the amount of statefor each MuSig2 signing session, allowing secure support for multiple parallel MuSig2 on embedded device with limited storage.

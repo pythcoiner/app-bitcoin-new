@@ -12,6 +12,7 @@ Dates are in `dd-mm-yyyy` format.
 ### Added
 
 - Support for [BIP-0322](https://github.com/bitcoin/bips/blob/master/bip-0322.mediawiki) (v2.0.0) generic signed messages: a PSBT carrying the `PSBT_GLOBAL_GENERIC_SIGNED_MESSAGE` global field (0x09) is now verified to have the exact BIP-322 *to_sign* structure and reviewed on-screen as a message signature (account, address and message), instead of being shown as a transaction with an `OP_RETURN` output and no fees. Proof-of-funds requests (additional inputs spending real coins of the account) are supported, with the total proven amount shown in the review. Works with any supported wallet policy, including multisig and miniscript.
+- One-round MuSig2 signing with pre-issued nonces, behind the `MUSIG2_PRENONCES` build flag (off by default): new `GET_MUSIG2_PRENONCES` and `ADVANCE_MUSIG2_PRENONCES` commands, a global PSBT field carrying the batch index, and a settings entry to reset the pre-nonce secret. See [DESIGN.md](DESIGN.md) and [OPEN_QUESTIONS.md](OPEN_QUESTIONS.md).
 
 ### Changed
 

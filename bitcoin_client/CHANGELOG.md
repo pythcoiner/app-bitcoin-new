@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Dates are in `dd-mm-yyyy` format.
 
+## [0.X.X] - XX-XX-XXXX
+
+### Added
+
+- `get_musig2_prenonces` and `advance_musig2_prenonces`, for apps built with the `MUSIG2_PRENONCES` flag, and `Musig2PrenonceBatch` with its `MPNB` binary form.
+- `PSBT.set_musig2_prenonce_j` and `PSBT.get_musig2_prenonce_j`: the global field carrying the pre-nonce batch index of a MuSig2 signer.
+
 ## [0.4.2] - 29-09-2026
 
 ### Added
