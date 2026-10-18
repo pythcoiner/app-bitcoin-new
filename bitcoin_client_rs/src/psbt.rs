@@ -6,12 +6,14 @@
 //! serialization/deserialization logic to rust-psbt (for known fields), and propagating unknown
 //! fields unchanged.
 
+use core::{array::TryFromSliceError, convert::TryFrom};
+
 use bitcoin::{
     consensus::encode::{serialize, Decodable},
     ecdsa,
     hashes::Hash,
     key::FromSliceError as KeyError,
-    psbt::Psbt,
+    psbt::{raw::ProprietaryKey, Psbt},
     secp256k1::{self, XOnlyPublicKey},
     taproot,
     taproot::TapLeafHash,
@@ -35,6 +37,11 @@ const PSBT_IN_SEQUENCE: u8 = 0x10;
 
 const PSBT_OUT_AMOUNT: u8 = 0x03;
 const PSBT_OUT_SCRIPT: u8 = 0x04;
+
+/// Proprietary identifier and subtype of the global field carrying the pre-nonce batch `j` of a
+/// MuSig2 signer, keyed by its participant pubkey.
+const MUSIG2_PRENONCE_IDENTIFIER: &[u8] = b"MUSIG2_PRENONCE";
+const MUSIG2_PRENONCE_SUBTYPE: u8 = 0x00;
 
 /// The `psbt` magic and its `0xff` separator, which precede the global map.
 const PSBT_MAGIC_LEN: usize = 5;
@@ -189,6 +196,33 @@ fn read_prefixed(d: &mut &[u8]) -> Option<Vec<u8>> {
     let (bytes, rest) = d.split_at(len as usize);
     *d = rest;
     Some(bytes.to_vec())
+}
+
+fn musig2_prenonce_j_key(pubkey: &[u8; 33]) -> ProprietaryKey {
+    ProprietaryKey {
+        prefix: MUSIG2_PRENONCE_IDENTIFIER.to_vec(),
+        subtype: MUSIG2_PRENONCE_SUBTYPE,
+        key: pubkey.to_vec(),
+    }
+}
+
+/// Sets the pre-nonce batch `j` used for a one-round signing by the MuSig2 signer with the
+/// participant pubkey `pubkey`.
+pub fn set_musig2_prenonce_j(psbt: &mut Psbt, pubkey: &[u8; 33], j: u32) {
+    psbt.proprietary
+        .insert(musig2_prenonce_j_key(pubkey), j.to_be_bytes().to_vec());
+}
+
+/// Returns the pre-nonce batch `j` of the MuSig2 signer with the participant pubkey `pubkey`, or
+/// `None` if absent. Errors if the value is not 4 bytes.
+pub fn get_musig2_prenonce_j(
+    psbt: &Psbt,
+    pubkey: &[u8; 33],
+) -> Result<Option<u32>, TryFromSliceError> {
+    psbt.proprietary
+        .get(&musig2_prenonce_j_key(pubkey))
+        .map(|value| <[u8; 4]>::try_from(value.as_slice()).map(u32::from_be_bytes))
+        .transpose()
 }
 
 #[derive(Debug, Clone)]
@@ -411,5 +445,38 @@ mod tests {
         );
         // a key length that runs past the end of the buffer
         assert!(split_maps(b"psbt\xff\x08\x01\x02", 1).is_none());
+    }
+
+    #[test]
+    fn musig2_prenonce_j_field() {
+        let pubkey = [0x02u8; 33];
+        let other_pubkey = [0x03u8; 33];
+        let mut psbt = unsigned_psbt();
+        assert_eq!(get_musig2_prenonce_j(&psbt, &pubkey).unwrap(), None);
+
+        set_musig2_prenonce_j(&mut psbt, &pubkey, 0x01020304);
+        assert_eq!(
+            get_musig2_prenonce_j(&psbt, &pubkey).unwrap(),
+            Some(0x01020304)
+        );
+        assert_eq!(get_musig2_prenonce_j(&psbt, &other_pubkey).unwrap(), None);
+
+        // the key and value the app reads
+        let mut key = vec![0xFC, 0x0F];
+        key.extend(b"MUSIG2_PRENONCE");
+        key.push(0x00);
+        key.extend(pubkey);
+        let maps = get_v2_maps(&psbt).unwrap();
+        let values: Vec<&Vec<u8>> = maps
+            .global
+            .iter()
+            .filter(|(k, _)| *k == key)
+            .map(|(_, value)| value)
+            .collect();
+        assert_eq!(values, vec![&vec![0x01, 0x02, 0x03, 0x04]]);
+
+        psbt.proprietary
+            .insert(musig2_prenonce_j_key(&pubkey), vec![0x00; 5]);
+        assert!(get_musig2_prenonce_j(&psbt, &pubkey).is_err());
     }
 }

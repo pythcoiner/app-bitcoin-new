@@ -1,7 +1,9 @@
 //! This module contains types that are specific to the Ledger Bitcoin application protocol.
 
 use bitcoin::{
-    consensus::encode::{deserialize_partial, Decodable, Encodable, Error as EncodeError},
+    consensus::encode::{
+        deserialize_partial, serialize, Decodable, Encodable, Error as EncodeError,
+    },
     hashes::Hash,
     io::{Read, Write},
     taproot::TapLeafHash,
@@ -236,6 +238,139 @@ pub fn parse_sign_psbt_yielded(
     }
 }
 
+/// Magic of the MPNB binary form of a [`Musig2PrenonceBatch`].
+pub const MUSIG2_PRENONCE_BATCH_MAGIC: &[u8; 4] = b"MPNB";
+/// Version of the MPNB binary form.
+pub const MUSIG2_PRENONCE_BATCH_VERSION: u8 = 1;
+
+/// A batch of pre-issued MuSig2 pubnonces returned by `get_musig2_prenonces`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Musig2PrenonceBatch {
+    /// The index of the batch, that a single signing call can use.
+    pub j: u32,
+    /// The index of the musig() key expression in the descriptor template.
+    pub k: u32,
+    /// The 33-byte compressed participant pubkey of the device.
+    pub participant_pubkey: [u8; 33],
+    /// The 33-byte compressed aggregate pubkey of the musig(), before any tweak.
+    pub aggregate_pubkey: [u8; 33],
+    /// The high-water mark of the device when the batch was issued.
+    pub hwm: u32,
+    /// The (input position, 66-byte pubnonce) pairs.
+    pub pubnonces: Vec<(u32, [u8; 66])>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Musig2PrenonceBatchError {
+    InvalidMagic,
+    UnsupportedVersion,
+    InvalidLength,
+}
+
+impl Musig2PrenonceBatch {
+    /// Builds the batch from the response and the yielded payloads of GET_MUSIG2_PRENONCES.
+    pub(crate) fn from_response(
+        j: u32,
+        k: u32,
+        response: &[u8],
+        yielded: &[Vec<u8>],
+    ) -> Result<Self, Musig2PrenonceBatchError> {
+        // response: participant pubkey || aggregate pubkey || hwm
+        let mut d = response;
+        let participant_pubkey = take(&mut d)?;
+        let aggregate_pubkey = take(&mut d)?;
+        let hwm = u32::from_be_bytes(take(&mut d)?);
+        if !d.is_empty() {
+            return Err(Musig2PrenonceBatchError::InvalidLength);
+        }
+        let pubnonces = yielded
+            .iter()
+            .map(|payload| {
+                let mut d = payload.as_slice();
+                let entry = take_pubnonce(&mut d)?;
+                if !d.is_empty() {
+                    return Err(Musig2PrenonceBatchError::InvalidLength);
+                }
+                Ok(entry)
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(Self {
+            j,
+            k,
+            participant_pubkey,
+            aggregate_pubkey,
+            hwm,
+            pubnonces,
+        })
+    }
+
+    /// Serializes the batch in the MPNB binary form, for files and QR codes.
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut data = MUSIG2_PRENONCE_BATCH_MAGIC.to_vec();
+        data.push(MUSIG2_PRENONCE_BATCH_VERSION);
+        data.extend_from_slice(&self.j.to_be_bytes());
+        data.extend_from_slice(&self.k.to_be_bytes());
+        data.extend_from_slice(&self.participant_pubkey);
+        data.extend_from_slice(&self.aggregate_pubkey);
+        data.extend_from_slice(&self.hwm.to_be_bytes());
+        data.extend(serialize(&UncheckedVarInt(self.pubnonces.len() as u64)));
+        for (i, pubnonce) in &self.pubnonces {
+            data.extend_from_slice(&i.to_be_bytes());
+            data.extend_from_slice(pubnonce);
+        }
+        data
+    }
+
+    /// Parses a batch in the MPNB binary form.
+    pub fn deserialize(data: &[u8]) -> Result<Self, Musig2PrenonceBatchError> {
+        let mut d = data;
+        if &take::<4>(&mut d)? != MUSIG2_PRENONCE_BATCH_MAGIC {
+            return Err(Musig2PrenonceBatchError::InvalidMagic);
+        }
+        if take::<1>(&mut d)?[0] != MUSIG2_PRENONCE_BATCH_VERSION {
+            return Err(Musig2PrenonceBatchError::UnsupportedVersion);
+        }
+        let j = u32::from_be_bytes(take(&mut d)?);
+        let k = u32::from_be_bytes(take(&mut d)?);
+        let participant_pubkey = take(&mut d)?;
+        let aggregate_pubkey = take(&mut d)?;
+        let hwm = u32::from_be_bytes(take(&mut d)?);
+        let UncheckedVarInt(n) = UncheckedVarInt::consensus_decode(&mut d)
+            .map_err(|_| Musig2PrenonceBatchError::InvalidLength)?;
+        let pubnonces = (0..n)
+            .map(|_| take_pubnonce(&mut d))
+            .collect::<Result<_, _>>()?;
+        if !d.is_empty() {
+            return Err(Musig2PrenonceBatchError::InvalidLength);
+        }
+        Ok(Self {
+            j,
+            k,
+            participant_pubkey,
+            aggregate_pubkey,
+            hwm,
+            pubnonces,
+        })
+    }
+}
+
+/// Reads `N` bytes, advancing `d` past them.
+fn take<const N: usize>(d: &mut &[u8]) -> Result<[u8; N], Musig2PrenonceBatchError> {
+    if d.len() < N {
+        return Err(Musig2PrenonceBatchError::InvalidLength);
+    }
+    let mut bytes = [0u8; N];
+    bytes.copy_from_slice(&d[..N]);
+    *d = &d[N..];
+    Ok(bytes)
+}
+
+/// Reads one `ser32(i) || pubnonce` entry.
+fn take_pubnonce(d: &mut &[u8]) -> Result<(u32, [u8; 66]), Musig2PrenonceBatchError> {
+    let i = u32::from_be_bytes(take(d)?);
+    Ok((i, take(d)?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -430,5 +565,92 @@ mod tests {
             parse_sign_psbt_yielded(&payload),
             Err(PartialSignatureError::PubKey(_))
         ));
+    }
+
+    fn prenonce_batch() -> Musig2PrenonceBatch {
+        let mut participant_pubkey = [0x11u8; 33];
+        participant_pubkey[0] = 0x02;
+        let mut aggregate_pubkey = [0x22u8; 33];
+        aggregate_pubkey[0] = 0x03;
+        Musig2PrenonceBatch {
+            j: 0x01020304,
+            k: 5,
+            participant_pubkey,
+            aggregate_pubkey,
+            hwm: 7,
+            pubnonces: vec![(0, [0x33u8; 66]), (9, [0x44u8; 66])],
+        }
+    }
+
+    #[test]
+    fn musig2_prenonce_batch_serialization() {
+        let batch = prenonce_batch();
+        let serialized = batch.serialize();
+
+        let mut expected = b"MPNB\x01".to_vec();
+        expected.extend(hex!("01020304"));
+        expected.extend(hex!("00000005"));
+        expected.push(0x02);
+        expected.extend([0x11u8; 32]);
+        expected.push(0x03);
+        expected.extend([0x22u8; 32]);
+        expected.extend(hex!("00000007"));
+        expected.push(0x02);
+        expected.extend(hex!("00000000"));
+        expected.extend([0x33u8; 66]);
+        expected.extend(hex!("00000009"));
+        expected.extend([0x44u8; 66]);
+        assert_eq!(serialized, expected);
+
+        assert_eq!(Musig2PrenonceBatch::deserialize(&serialized), Ok(batch));
+
+        let mut wrong_magic = serialized.clone();
+        wrong_magic[3] = b'X';
+        assert_eq!(
+            Musig2PrenonceBatch::deserialize(&wrong_magic),
+            Err(Musig2PrenonceBatchError::InvalidMagic)
+        );
+        let mut wrong_version = serialized.clone();
+        wrong_version[4] = 0x02;
+        assert_eq!(
+            Musig2PrenonceBatch::deserialize(&wrong_version),
+            Err(Musig2PrenonceBatchError::UnsupportedVersion)
+        );
+        let mut trailing = serialized.clone();
+        trailing.push(0x00);
+        assert_eq!(
+            Musig2PrenonceBatch::deserialize(&trailing),
+            Err(Musig2PrenonceBatchError::InvalidLength)
+        );
+        assert_eq!(
+            Musig2PrenonceBatch::deserialize(&serialized[..serialized.len() - 1]),
+            Err(Musig2PrenonceBatchError::InvalidLength)
+        );
+    }
+
+    #[test]
+    fn musig2_prenonce_batch_from_response() {
+        let batch = prenonce_batch();
+        let mut response = batch.participant_pubkey.to_vec();
+        response.extend(batch.aggregate_pubkey);
+        response.extend(hex!("00000007"));
+        let yielded: Vec<Vec<u8>> = batch
+            .pubnonces
+            .iter()
+            .map(|(i, pubnonce)| [&i.to_be_bytes()[..], &pubnonce[..]].concat())
+            .collect();
+
+        assert_eq!(
+            Musig2PrenonceBatch::from_response(0x01020304, 5, &response, &yielded),
+            Ok(batch)
+        );
+        assert_eq!(
+            Musig2PrenonceBatch::from_response(0x01020304, 5, &response[..69], &yielded),
+            Err(Musig2PrenonceBatchError::InvalidLength)
+        );
+        assert_eq!(
+            Musig2PrenonceBatch::from_response(0x01020304, 5, &response, &[vec![0x00; 71]]),
+            Err(Musig2PrenonceBatchError::InvalidLength)
+        );
     }
 }

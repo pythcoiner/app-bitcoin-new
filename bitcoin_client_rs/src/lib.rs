@@ -16,6 +16,9 @@ pub mod wallet;
 pub mod async_client;
 
 pub use client::{BitcoinClient, Transport};
-pub use protocol::{MusigPartialSignature, MusigPubNonce, SignPsbtYieldedObject};
+pub use protocol::{
+    Musig2PrenonceBatch, Musig2PrenonceBatchError, MusigPartialSignature, MusigPubNonce,
+    SignPsbtYieldedObject,
+};
 pub use psbt::{PartialSignature, PartialSignatureError};
 pub use wallet::{WalletPolicy, WalletPubKey};

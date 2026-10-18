@@ -21,6 +21,8 @@ pub enum BitcoinCommandCode {
     GetWalletAddress = 0x03,
     SignPSBT = 0x04,
     GetMasterFingerprint = 0x05,
+    GetMusig2Prenonces = 0x06,
+    AdvanceMusig2Prenonces = 0x07,
     SignMessage = 0x10,
 }
 

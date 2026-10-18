@@ -1,5 +1,4 @@
-use core::fmt::Debug;
-use core::str::FromStr;
+use core::{convert::TryFrom, fmt::Debug, str::FromStr};
 
 use bitcoin::{
     address,
@@ -316,6 +315,58 @@ impl<T: Transport> BitcoinClient<T> {
         }
 
         Ok(yielded_objects)
+    }
+
+    /// Returns the pre-issued MuSig2 pubnonces of the batch `j`, for the musig() key expression
+    /// `keyexpr_index` of a registered wallet and the input positions `input_start` to
+    /// `input_start + input_count - 1`. No confirmation is asked on the device.
+    pub fn get_musig2_prenonces(
+        &self,
+        wallet: &WalletPolicy,
+        wallet_hmac: &[u8; 32],
+        j: u32,
+        keyexpr_index: u32,
+        input_start: u32,
+        input_count: u8,
+    ) -> Result<Musig2PrenonceBatch, BitcoinClientError<T::Error>> {
+        let mut intpr = ClientCommandInterpreter::new();
+        intpr.add_known_preimage(wallet.serialize());
+        let keys: Vec<String> = wallet.keys.iter().map(|k| k.to_string()).collect();
+        intpr.add_known_list(&keys);
+        // necessary for version 1 of the protocol (introduced in version 2.1.0)
+        intpr.add_known_preimage(wallet.descriptor_template.as_bytes().to_vec());
+        let cmd = command::get_musig2_prenonces(
+            wallet,
+            wallet_hmac,
+            j,
+            keyexpr_index,
+            input_start,
+            input_count,
+        );
+        let data = self.make_request(&cmd, Some(&mut intpr))?;
+        Musig2PrenonceBatch::from_response(j, keyexpr_index, &data, &intpr.yielded()).map_err(
+            |_| BitcoinClientError::UnexpectedResult {
+                command: cmd.ins,
+                data,
+            },
+        )
+    }
+
+    /// Raises the high-water mark of the pre-nonce window to `new_hwm`, consuming every batch
+    /// below it, and returns the high-water mark after the call. No confirmation is asked on the
+    /// device.
+    pub fn advance_musig2_prenonces(
+        &self,
+        new_hwm: u32,
+    ) -> Result<u32, BitcoinClientError<T::Error>> {
+        let cmd = command::advance_musig2_prenonces(new_hwm);
+        let data = self.make_request(&cmd, None)?;
+        <[u8; 4]>::try_from(data.as_slice())
+            .map(u32::from_be_bytes)
+            .map_err(|_| BitcoinClientError::UnexpectedResult {
+                command: cmd.ins,
+                data,
+            })
     }
 
     /// Sign a message with the key derived with the given derivation path.

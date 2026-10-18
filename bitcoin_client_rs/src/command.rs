@@ -114,6 +114,40 @@ pub fn sign_psbt(
     }
 }
 
+/// Creates the APDU command required to get the pre-issued MuSig2 pubnonces of the batch `j`.
+pub fn get_musig2_prenonces(
+    policy: &WalletPolicy,
+    hmac: &[u8; 32],
+    j: u32,
+    keyexpr_index: u32,
+    input_start: u32,
+    input_count: u8,
+) -> APDUCommand {
+    let mut data: Vec<u8> = Vec::new();
+    data.extend_from_slice(&policy.id());
+    data.extend_from_slice(hmac);
+    data.extend_from_slice(&j.to_be_bytes());
+    data.extend(encode::serialize(&UncheckedVarInt(keyexpr_index as u64)));
+    data.extend_from_slice(&input_start.to_be_bytes());
+    data.push(input_count);
+    APDUCommand {
+        cla: apdu::Cla::Bitcoin as u8,
+        ins: apdu::BitcoinCommandCode::GetMusig2Prenonces as u8,
+        data,
+        ..Default::default()
+    }
+}
+
+/// Creates the APDU command required to raise the high-water mark of the pre-nonce window.
+pub fn advance_musig2_prenonces(new_hwm: u32) -> APDUCommand {
+    APDUCommand {
+        cla: apdu::Cla::Bitcoin as u8,
+        ins: apdu::BitcoinCommandCode::AdvanceMusig2Prenonces as u8,
+        data: new_hwm.to_be_bytes().to_vec(),
+        ..Default::default()
+    }
+}
+
 /// Creates the APDU Command to sign a message.
 pub fn sign_message(
     message_length: usize,
