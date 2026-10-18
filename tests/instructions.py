@@ -302,6 +302,24 @@ def sign_psbt_instruction_approve(model: Firmware, save_screenshot: bool = True,
     return instructions
 
 
+def sign_psbt_instruction_reject(model: Firmware, save_screenshot: bool = True) -> Instructions:
+    instructions = Instructions(model)
+
+    if model.name.startswith("nano"):
+        instructions.new_request("Reject", save_screenshot=save_screenshot)
+    else:
+        instructions.new_request("Review", NavInsID.USE_CASE_REVIEW_TAP, NavInsID.USE_CASE_REVIEW_TAP,
+                                 save_screenshot=save_screenshot)
+        instructions.same_request("Amount", NavInsID.USE_CASE_REVIEW_TAP, NavInsID.USE_CASE_REVIEW_REJECT,
+                                  save_screenshot=save_screenshot)
+        instructions.same_request("Reject", NavInsID.USE_CASE_REVIEW_TAP, NavInsID.USE_CASE_CHOICE_CONFIRM,
+                                  save_screenshot=save_screenshot)
+        instructions.new_request("Transaction", NavInsID.USE_CASE_REVIEW_TAP, NavInsID.USE_CASE_STATUS_DISMISS,
+                                 save_screenshot=save_screenshot)
+
+    return instructions
+
+
 def sign_psbt_instruction_approve_selftransfer(model: Firmware) -> Instructions:
     instructions = Instructions(model)
 

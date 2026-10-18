@@ -1,6 +1,7 @@
 from hashlib import sha256
 import hmac
-from typing import List, Tuple
+from io import BytesIO
+from typing import Callable, List, Tuple
 
 import pytest
 
@@ -9,17 +10,22 @@ from ragger.firmware import Firmware
 from ragger.navigator import Navigator
 
 from ledger_bitcoin import Musig2PrenonceBatch, MusigPartialSignature
-from ledger_bitcoin.client_command import ClientCommandCode, ClientCommandInterpreter
+from ledger_bitcoin.client_command import CCMD_YIELD_MUSIG_PARTIALSIGNATURE_TAG, ClientCommandCode, ClientCommandInterpreter
+from ledger_bitcoin.common import read_varint
+from ledger_bitcoin.exception.device_exception import DeviceException
+from ledger_bitcoin.exception.errors import DenyError
+from ledger_bitcoin.merkle import element_hash
 from ledger_bitcoin.key import ExtendedKey
 from ledger_bitcoin.psbt import PSBT
 from ledger_bitcoin.wallet import WalletPolicy
 from ragger_bitcoin import RaggerClient
 from test_utils import SpeculosGlobals, bip0327, txmaker
 from test_utils.bip0322 import build_bip322_psbt
-from test_utils.musig2 import HotMusig2Cosigner, MuSig2KeyPlaceholder, TrDescriptorTemplate, aggregate_musig_pubkey, process_placeholder, run_musig2_test
+from test_utils.musig2 import HotMusig2Cosigner, MuSig2KeyPlaceholder, PsbtMusig2Cosigner, TrDescriptorTemplate, aggregate_musig_pubkey, process_placeholder, run_musig2_test
 from test_utils.taproot_sighash import SIGHASH_DEFAULT, TaprootSignatureHash
 
-from .instructions import sign_psbt_instruction_approve
+from .instructions import sign_psbt_instruction_approve, sign_psbt_instruction_reject
+from .test_musig2_prenonces import reset_musig2_prenonces_instructions
 from .test_sign_psbt_musig import KEYPATH_COSIGNER_1_XPUB, KEYPATH_COSIGNER_2_XPRIV, KEYPATH_COSIGNER_2_XPUB, KEYPATH_PSBT_B64, KEYPATH_SIGHASHES, SCRIPTPATH_COSIGNER_1_XPUB, SCRIPTPATH_COSIGNER_2_XPRIV, SCRIPTPATH_COSIGNER_2_XPUB, SCRIPTPATH_INTERNAL_XPUB, SCRIPTPATH_PSBT_B64, SCRIPTPATH_SIGHASHES, LedgerMusig2Cosigner, keypath_wallet_policy, musig_pubnonce_ids, scriptpath_wallet_policy
 
 SW_INCORRECT_DATA = 0x6A80
@@ -39,6 +45,8 @@ EC_SIGN_PSBT_MUSIG2_PRENONCE_PUBNONCE_MISMATCH = 0x001d
 EC_SIGN_PSBT_MUSIG2_PRENONCE_COSIGNER_PUBNONCE = 0x001e
 
 PRENONCE_WINDOW_SIZE = 128
+
+PSBT_IN_MUSIG2_PUB_NONCE = 0x1B
 
 # another key of the device, used in a second musig()
 OTHER_INTERNAL_XPUB = "[f5acc2fd/48'/1'/0'/2']tpubDFAqEGNyad35aBCKUAXbQGDjdVhNueno5ZZVEn3sQbW5ci457gLR7HyTmHBg93oourBssgUxuWz1jX5uhc1qaqFo9VsybY1J5FuedLfm4dK"
@@ -461,3 +469,165 @@ def test_sign_psbt_musig2_prenonces_no_state(client: RaggerClient, speculos_glob
     with pytest.raises(ExceptionRAPDU) as e:
         client.advance_musig2_prenonces(0)
     assert e.value.status == SW_BAD_STATE
+
+
+def is_partial_signature_yield(request: bytes) -> bool:
+    return request[0] == ClientCommandCode.YIELD and \
+        read_varint(BytesIO(request[1:])) == CCMD_YIELD_MUSIG_PARTIALSIGNATURE_TAG
+
+
+def fail_client_requests(monkeypatch, should_fail: Callable[[bytes], bool]) -> List[bytes]:
+    # answers with an empty, malformed response every client command for which should_fail is true;
+    # returns the list of the requests that were answered normally
+    requests: List[bytes] = []
+    execute = ClientCommandInterpreter.execute
+
+    def failing_execute(self, hw_response: bytes) -> bytes:
+        if should_fail(hw_response):
+            return b''
+        requests.append(hw_response)
+        return execute(self, hw_response)
+
+    monkeypatch.setattr(ClientCommandInterpreter, "execute", failing_execute)
+    return requests
+
+
+def test_sign_psbt_musig2_prenonces_rejected(navigator: Navigator, firmware: Firmware, client: RaggerClient,
+                                             test_name: str, speculos_globals: SpeculosGlobals,
+                                             client_requests: List[bytes]):
+    wallet_policy, wallet_hmac = keypath_wallet_policy(speculos_globals)
+
+    psbt, _ = prenonce_psbt(client, wallet_policy, wallet_hmac, keypath_psbt(), 0, KEYPATH_COSIGNER_2_XPRIV)
+
+    client_requests.clear()
+    with pytest.raises(ExceptionRAPDU) as e:
+        client.sign_psbt(psbt, wallet_policy, wallet_hmac, navigator, testname=test_name,
+                         instructions=sign_psbt_instruction_reject(firmware, save_screenshot=False))
+    assert DeviceException.exc.get(e.value.status) == DenyError
+    assert_nothing_yielded(client_requests)
+
+    # the rejection consumed nothing: the same j signs afterwards
+    result = client.sign_psbt(psbt, wallet_policy, wallet_hmac, navigator, testname=test_name,
+                              instructions=sign_psbt_instruction_approve(
+                                  firmware, save_screenshot=False, has_spend_from_wallet=True, has_feewarning=True))
+    assert len(result) == 1 and isinstance(result[0][1], MusigPartialSignature)
+
+
+def test_sign_psbt_musig2_prenonces_client_failure_before_commit(navigator: Navigator, firmware: Firmware,
+                                                                 client: RaggerClient, test_name: str,
+                                                                 speculos_globals: SpeculosGlobals, monkeypatch):
+    wallet_policy, wallet_hmac = keypath_wallet_policy(speculos_globals)
+
+    psbt, batches = prenonce_psbt(client, wallet_policy, wallet_hmac, keypath_psbt(), 0, KEYPATH_COSIGNER_2_XPRIV)
+
+    # the host fails the lookup of our pubnonce, done while validating, before the review
+    aggpk_tweaked, _ = musig_pubnonce_ids(wallet_policy, psbt)[(0, 0)]
+    pubnonce_key_hash = element_hash(bytes([PSBT_IN_MUSIG2_PUB_NONCE]) + batches[0].pk + aggpk_tweaked)
+    requests = fail_client_requests(
+        monkeypatch,
+        lambda request: request[0] == ClientCommandCode.GET_MERKLE_LEAF_INDEX and request[-32:] == pubnonce_key_hash)
+
+    with pytest.raises(ExceptionRAPDU) as e:
+        client.sign_psbt(psbt, wallet_policy, wallet_hmac)
+    assert_refused(e.value, SW_INCORRECT_DATA, EC_SIGN_PSBT_MUSIG2_PRENONCE_MISSING_PUBNONCE)
+    assert_nothing_yielded(requests)
+
+    # j was not consumed: once the host answers, the same j signs
+    monkeypatch.undo()
+    result = client.sign_psbt(psbt, wallet_policy, wallet_hmac, navigator, testname=test_name,
+                              instructions=sign_psbt_instruction_approve(
+                                  firmware, save_screenshot=False, has_spend_from_wallet=True, has_feewarning=True))
+    assert len(result) == 1 and isinstance(result[0][1], MusigPartialSignature)
+
+
+def test_sign_psbt_musig2_prenonces_abort_after_commit(navigator: Navigator, firmware: Firmware,
+                                                       client: RaggerClient, test_name: str,
+                                                       speculos_globals: SpeculosGlobals, monkeypatch):
+    wallet_policy, wallet_hmac = keypath_wallet_policy(speculos_globals)
+
+    psbt = txmaker.createPsbt(wallet_policy, [100_000, 200_000], [250_000], [False])
+    psbt, _ = prenonce_psbt(client, wallet_policy, wallet_hmac, psbt, 0, KEYPATH_COSIGNER_2_XPRIV)
+
+    # the host fails the first client command after the first partial signature
+    yielded_partial_signature = False
+
+    def after_first_partial_signature(request: bytes) -> bool:
+        nonlocal yielded_partial_signature
+        if yielded_partial_signature:
+            return True
+        yielded_partial_signature = is_partial_signature_yield(request)
+        return False
+
+    requests = fail_client_requests(monkeypatch, after_first_partial_signature)
+
+    with pytest.raises(ExceptionRAPDU) as e:
+        client.sign_psbt(psbt, wallet_policy, wallet_hmac, navigator, testname=test_name,
+                         instructions=sign_psbt_instruction_approve(
+                             firmware, save_screenshot=False, has_spend_from_wallet=True, has_feewarning=True))
+    assert e.value.status == SW_INCORRECT_DATA
+    assert len([request for request in requests if request[0] == ClientCommandCode.YIELD]) == 1
+
+    # j is burned: a retry of the same psbt is refused
+    monkeypatch.undo()
+    with pytest.raises(ExceptionRAPDU) as e:
+        client.sign_psbt(psbt, wallet_policy, wallet_hmac)
+    assert_refused(e.value, SW_INCORRECT_DATA, EC_SIGN_PSBT_MUSIG2_PRENONCE_J_NOT_AVAILABLE)
+
+
+def test_sign_psbt_musig2_prenonces_regenerated(navigator: Navigator, firmware: Firmware, client: RaggerClient,
+                                                speculos_globals: SpeculosGlobals, client_requests: List[bytes]):
+    wallet_policy, wallet_hmac = keypath_wallet_policy(speculos_globals)
+
+    psbt, _ = prenonce_psbt(client, wallet_policy, wallet_hmac, keypath_psbt(), 0, KEYPATH_COSIGNER_2_XPRIV)
+
+    navigator.navigate(reset_musig2_prenonces_instructions(firmware, True),
+                       screen_change_before_first_instruction=False)
+
+    expect_refused(client, wallet_policy, wallet_hmac, psbt, client_requests,
+                   SW_INCORRECT_DATA, EC_SIGN_PSBT_MUSIG2_PRENONCE_PUBNONCE_MISMATCH)
+
+
+class OneRoundSigningCosigner(PsbtMusig2Cosigner):
+    """
+    Not a real cosigner: when asked for its pubnonces, it makes the device sign another transaction
+    of the same wallet policy in one round. Used to check that this does not interfere with the
+    pending two-round session.
+    """
+
+    def __init__(self, prenonce_cosigner: PrenonceMusig2Cosigner, psbt: PSBT, cosigner_xpriv: str) -> None:
+        super().__init__()
+        self.prenonce_cosigner = prenonce_cosigner
+        self.psbt = psbt
+        self.cosigner_xpriv = cosigner_xpriv
+
+    def get_participant_pubkey(self) -> bip0327.Point:
+        return self.prenonce_cosigner.get_participant_pubkey()
+
+    def generate_public_nonces(self, psbt: PSBT) -> None:
+        wallet_policy = self.prenonce_cosigner.wallet_policy
+        run_musig2_test(wallet_policy, self.psbt,
+                        [self.prenonce_cosigner, HotMusig2Cosigner(wallet_policy, self.cosigner_xpriv)],
+                        compute_sighashes(wallet_policy, self.psbt))
+
+    def generate_partial_signatures(self, psbt: PSBT) -> None:
+        pass
+
+
+def test_sign_psbt_musig2_prenonces_keep_two_round_session(navigator: Navigator, firmware: Firmware,
+                                                           client: RaggerClient, test_name: str,
+                                                           speculos_globals: SpeculosGlobals):
+    wallet_policy, wallet_hmac = keypath_wallet_policy(speculos_globals)
+    instructions = sign_psbt_instruction_approve(
+        firmware, save_screenshot=False, has_spend_from_wallet=True, has_feewarning=True)
+
+    signer_1 = LedgerMusig2Cosigner(client, wallet_policy, wallet_hmac, navigator=navigator, testname=test_name,
+                                    instructions=instructions)
+    one_round = OneRoundSigningCosigner(
+        PrenonceMusig2Cosigner(0, client, wallet_policy, wallet_hmac, navigator=navigator, testname=test_name,
+                               instructions=instructions),
+        other_keypath_psbt(), KEYPATH_COSIGNER_2_XPRIV)
+    signer_2 = HotMusig2Cosigner(wallet_policy, KEYPATH_COSIGNER_2_XPRIV)
+
+    # the device executes round 1 of the two-round flow, then signs another transaction in one
+    # round, then round 2 of the two-round flow
+    run_musig2_test(wallet_policy, keypath_psbt(), [signer_1, one_round, signer_2], KEYPATH_SIGHASHES)
