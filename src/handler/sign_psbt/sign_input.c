@@ -22,6 +22,7 @@
 
 /* SDK headers */
 #include "crypto_helpers.h"
+#include "swap.h"
 #include "varint.h"
 
 /* Local headers */
@@ -450,6 +451,18 @@ static bool __attribute__((noinline)) sign_transaction_input(dispatcher_context_
                                                     sighash_byte,
                                                     sighash))
                     return false;
+#ifdef HAVE_MUSIG2_PRENONCES
+            } else if (keyexpr_info->key_expression_ptr->type == KEY_EXPRESSION_MUSIG &&
+                       signing_state->prenonce.active) {
+                if (!sign_sighash_musig_prenonce_and_yield(dc,
+                                                           st,
+                                                           signing_state,
+                                                           keyexpr_info,
+                                                           input,
+                                                           cur_input_index,
+                                                           sighash))
+                    return false;
+#endif /* HAVE_MUSIG2_PRENONCES */
             } else if (keyexpr_info->key_expression_ptr->type == KEY_EXPRESSION_MUSIG) {
                 // we only execute MuSig2 round 2 if there are pubnonces in the PSBT
                 // (otherwise, we are only here just for the other non-musig2 partial signatures)
@@ -549,14 +562,23 @@ static bool select_keyexprs_to_process(
     return any;
 }
 
-bool __attribute__((noinline)) produce_musig2_pubnonces(
+// Processes one (internal input, musig() key expression) pair. On failure, it already sends an
+// error status word.
+typedef bool (*musig_pair_processor_t)(dispatcher_context_t *dc,
+                                       sign_psbt_state_t *st,
+                                       signing_state_t *signing_state,
+                                       const keyexpr_info_t *keyexpr_info,
+                                       const input_info_t *input,
+                                       unsigned int cur_input_index);
+
+// Calls process for every internal input and every internal musig() key expression we sign.
+static bool __attribute__((noinline)) process_musig_pairs(
     dispatcher_context_t *dc,
     sign_psbt_state_t *st,
     signing_state_t *signing_state,
     sign_psbt_cache_t *sign_psbt_cache,
-    const uint8_t internal_inputs[static BITVECTOR_REAL_SIZE(MAX_N_INPUTS_CAN_SIGN)]) {
-    LOG_PROCESSOR(__FILE__, __LINE__, __func__);
-
+    const uint8_t internal_inputs[static BITVECTOR_REAL_SIZE(MAX_N_INPUTS_CAN_SIGN)],
+    musig_pair_processor_t process) {
     if (st->account.policy_map->type != TOKEN_TR) {
         return true;  // nothing to do
     }
@@ -636,7 +658,7 @@ bool __attribute__((noinline)) produce_musig2_pubnonces(
                 }
             }
 
-            if (!produce_and_yield_pubnonce(dc, st, signing_state, keyexpr_info, &input, i)) {
+            if (!process(dc, st, signing_state, keyexpr_info, &input, i)) {
                 return false;
             }
         }
@@ -644,6 +666,150 @@ bool __attribute__((noinline)) produce_musig2_pubnonces(
 
     return true;
 }
+
+bool __attribute__((noinline)) produce_musig2_pubnonces(
+    dispatcher_context_t *dc,
+    sign_psbt_state_t *st,
+    signing_state_t *signing_state,
+    sign_psbt_cache_t *sign_psbt_cache,
+    const uint8_t internal_inputs[static BITVECTOR_REAL_SIZE(MAX_N_INPUTS_CAN_SIGN)]) {
+    LOG_PROCESSOR(__FILE__, __LINE__, __func__);
+
+    return process_musig_pairs(dc,
+                               st,
+                               signing_state,
+                               sign_psbt_cache,
+                               internal_inputs,
+                               produce_and_yield_pubnonce);
+}
+
+#ifdef HAVE_MUSIG2_PRENONCES
+// Reads the pre-nonce j field of the participant key of each musig() key expression we sign. It
+// sets active if they all have the same j, and leaves it false if none has it. On failure, it
+// already sends an error status word.
+static bool __attribute__((noinline)) read_musig2_prenonce_j(dispatcher_context_t *dc,
+                                                             sign_psbt_state_t *st,
+                                                             bool *active,
+                                                             uint32_t *j) {
+    *active = false;
+    bool first = true;
+    for (size_t i = 0; i < st->account.n_internal_key_expressions; i++) {
+        const keyexpr_info_t *keyexpr_info = &st->account.internal_key_expressions[i];
+        if (!keyexpr_info->to_sign ||
+            keyexpr_info->key_expression_ptr->type != KEY_EXPRESSION_MUSIG) {
+            continue;
+        }
+
+        uint32_t keyexpr_j = 0;
+        psbt_field_status_t status =
+            psbt_get_global_musig2_prenonce_j(dc,
+                                              &st->global_map,
+                                              keyexpr_info->internal_pubkey.compressed_pubkey,
+                                              &keyexpr_j);
+        if (status == PSBT_FIELD_ERROR) {
+            PRINTF("Malformed pre-nonce j field\n");
+            SEND_SW_EC(dc, SW_INCORRECT_DATA, EC_SIGN_PSBT_MUSIG2_PRENONCE_MALFORMED_J);
+            return false;
+        }
+
+        bool keyexpr_active = status == PSBT_FIELD_PRESENT;
+        if (!first && (keyexpr_active != *active || keyexpr_j != *j)) {
+            PRINTF("The musig() key expressions do not have the same pre-nonce j\n");
+            SEND_SW_EC(dc, SW_INCORRECT_DATA, EC_SIGN_PSBT_MUSIG2_PRENONCE_INCONSISTENT_J);
+            return false;
+        }
+        *active = keyexpr_active;
+        *j = keyexpr_j;
+        first = false;
+    }
+    return true;
+}
+
+bool __attribute__((noinline)) validate_musig2_prenonces(
+    dispatcher_context_t *dc,
+    sign_psbt_state_t *st,
+    signing_state_t *signing_state,
+    sign_psbt_cache_t *sign_psbt_cache,
+    const uint8_t internal_inputs[static BITVECTOR_REAL_SIZE(MAX_N_INPUTS_CAN_SIGN)]) {
+    LOG_PROCESSOR(__FILE__, __LINE__, __func__);
+
+    prenonce_signing_state_t *prenonce = &signing_state->prenonce;
+
+    bool active;
+    uint32_t j;
+    if (!read_musig2_prenonce_j(dc, st, &active, &j)) {
+        return false;
+    }
+    if (!active) {
+        return true;  // the j fields are for other signers
+    }
+
+    bool allowed = !st->bip322.is_message_signing;
+#ifdef HAVE_SWAP
+    allowed = allowed && !G_called_from_swap;
+#endif /* HAVE_SWAP */
+    if (!allowed) {
+        PRINTF("One-round MuSig2 signing is not allowed for swaps and BIP-322\n");
+        SEND_SW_EC(dc, SW_NOT_SUPPORTED, EC_SIGN_PSBT_MUSIG2_PRENONCE_NOT_ALLOWED);
+        return false;
+    }
+
+    if (!st->has_musig2_pub_nonces) {
+        PRINTF("Pre-nonce j field without pubnonces\n");
+        SEND_SW_EC(dc, SW_INCORRECT_DATA, EC_SIGN_PSBT_MUSIG2_PRENONCE_NO_PUBNONCES);
+        return false;
+    }
+
+    if (prenonce_storage_load(&prenonce->state) != PRENONCE_STORAGE_OK) {
+        PRINTF("No pre-nonce state\n");
+        SEND_SW_EC(dc, SW_BAD_STATE, EC_SIGN_PSBT_MUSIG2_PRENONCE_STATE_UNAVAILABLE);
+        return false;
+    }
+
+    if (!prenonce_window_check(&prenonce->state.window, j)) {
+        PRINTF("j is not available\n");
+        SEND_SW_EC(dc, SW_INCORRECT_DATA, EC_SIGN_PSBT_MUSIG2_PRENONCE_J_NOT_AVAILABLE);
+        return false;
+    }
+
+    prenonce->active = true;
+    prenonce->j = j;
+    get_policy_wallet_id(&st->account.wallet_header, prenonce->wallet_id);
+
+    return process_musig_pairs(dc,
+                               st,
+                               signing_state,
+                               sign_psbt_cache,
+                               internal_inputs,
+                               validate_musig_prenonce);
+}
+
+bool __attribute__((noinline)) commit_musig2_prenonce(dispatcher_context_t *dc,
+                                                      signing_state_t *signing_state) {
+    LOG_PROCESSOR(__FILE__, __LINE__, __func__);
+
+    prenonce_signing_state_t *prenonce = &signing_state->prenonce;
+    if (!prenonce->active) {
+        return true;
+    }
+
+    // the state must not have changed since the validation, as the pubnonces were checked with it
+    prenonce_state_t state;
+    bool ok = prenonce_storage_load(&state) == PRENONCE_STORAGE_OK &&
+              state.epoch == prenonce->state.epoch &&
+              memcmp(state.nonce_init, prenonce->state.nonce_init, sizeof(state.nonce_init)) == 0 &&
+              prenonce_window_consume(&state.window, prenonce->j) && prenonce_storage_store(&state);
+    explicit_bzero(&state, sizeof(state));
+    if (!ok) {
+        PRINTF("Failed to consume the pre-nonce j\n");
+        SEND_SW_EC(dc, SW_BAD_STATE, EC_SIGN_PSBT_MUSIG2_PRENONCE_COMMIT_FAILED);
+        return false;
+    }
+
+    prenonce->committed = true;
+    return true;
+}
+#endif /* HAVE_MUSIG2_PRENONCES */
 
 bool __attribute__((noinline)) sign_transaction(
     dispatcher_context_t *dc,

@@ -81,6 +81,33 @@ bool produce_musig2_pubnonces(
     sign_psbt_cache_t *sign_psbt_cache,
     const uint8_t internal_inputs[static BITVECTOR_REAL_SIZE(MAX_N_INPUTS_CAN_SIGN)]);
 
+#ifdef HAVE_MUSIG2_PRENONCES
+/**
+ * One-round MuSig2 with pre-issued nonces: if the PSBT has the pre-nonce j field for the
+ * participant key of the musig() key expressions we sign, checks that j can be consumed and that
+ * every (internal input, musig() key expression) pair has our pre-nonce of j and the pubnonces of
+ * all the cosigners. Nothing is consumed.
+ *
+ * Returns true on success, including if the PSBT is not a one-round request for us; false on
+ * failure, in which case an error status word has already been sent.
+ */
+bool validate_musig2_prenonces(
+    dispatcher_context_t *dc,
+    sign_psbt_state_t *st,
+    signing_state_t *signing_state,
+    sign_psbt_cache_t *sign_psbt_cache,
+    const uint8_t internal_inputs[static BITVECTOR_REAL_SIZE(MAX_N_INPUTS_CAN_SIGN)]);
+
+/**
+ * For a one-round MuSig2 signing, consumes j in NVRAM; it must be called after the user approval
+ * and before any partial signature is computed.
+ *
+ * Returns true on success, or if the signing is not a one-round MuSig2 signing; false on failure,
+ * in which case an error status word has already been sent.
+ */
+bool commit_musig2_prenonce(dispatcher_context_t *dc, signing_state_t *signing_state);
+#endif
+
 /**
  * Iterates over all the internal key expressions and all internal inputs,
  * producing the appropriate signature for each (legacy ECDSA, SegwitV0

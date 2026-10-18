@@ -109,6 +109,38 @@
 // proven amount shown to the user must be trustworthy, and external inputs cannot be signed.
 #define EC_SIGN_PSBT_BIP322_EXTERNAL_INPUTS 0x0015
 
+// The pre-nonce j field of our participant key is not a 4-byte value.
+#define EC_SIGN_PSBT_MUSIG2_PRENONCE_MALFORMED_J 0x0016
+
+// The musig() key expressions we sign do not all have the same pre-nonce j field.
+#define EC_SIGN_PSBT_MUSIG2_PRENONCE_INCONSISTENT_J 0x0017
+
+// One-round MuSig2 signing is not allowed when called from the Exchange app, nor for BIP-322.
+#define EC_SIGN_PSBT_MUSIG2_PRENONCE_NOT_ALLOWED 0x0018
+
+// The PSBT has the pre-nonce j field, but no MuSig2 pubnonce.
+#define EC_SIGN_PSBT_MUSIG2_PRENONCE_NO_PUBNONCES 0x0019
+
+// The pre-nonce state could not be loaded. Signing does not create it.
+#define EC_SIGN_PSBT_MUSIG2_PRENONCE_STATE_UNAVAILABLE 0x001a
+
+// j is below the high-water mark, beyond the window, or already consumed.
+#define EC_SIGN_PSBT_MUSIG2_PRENONCE_J_NOT_AVAILABLE 0x001b
+
+// Our pubnonce is missing or malformed for an input and musig() key expression we sign. Mixing
+// one-round and two-round MuSig2 signing in the same PSBT is not supported.
+#define EC_SIGN_PSBT_MUSIG2_PRENONCE_MISSING_PUBNONCE 0x001c
+
+// Our pubnonce in the PSBT is not the pre-nonce of j for this wallet policy, input position and
+// key expression.
+#define EC_SIGN_PSBT_MUSIG2_PRENONCE_PUBNONCE_MISMATCH 0x001d
+
+// The pubnonce of a cosigner is missing or invalid, or the nonce aggregation failed.
+#define EC_SIGN_PSBT_MUSIG2_PRENONCE_COSIGNER_PUBNONCE 0x001e
+
+// j could not be consumed after the approval; no partial signature was produced.
+#define EC_SIGN_PSBT_MUSIG2_PRENONCE_COMMIT_FAILED 0x001f
+
 /**
  * GET_MUSIG2_PRENONCES
  */

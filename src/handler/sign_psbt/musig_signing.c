@@ -25,7 +25,11 @@
 /* Local headers */
 #include "client_commands.h"
 #include "commands.h"
+#include "error_codes.h"
 #include "get_merkleized_map_value.h"
+#ifdef HAVE_MUSIG2_PRENONCES
+#include "musig_prenonce.h"
+#endif
 #include "policy.h"
 #include "psbt.h"
 #include "sw.h"
@@ -631,3 +635,163 @@ bool __attribute__((noinline)) sign_sighash_musig_and_yield(dispatcher_context_t
                                                   &secnonce,
                                                   sighash);
 }
+
+#ifdef HAVE_MUSIG2_PRENONCES
+
+// Derives our pre-nonce of the batch j for the input and key expression. On failure, the secnonce
+// is zeroed out.
+static bool __attribute__((noinline)) derive_my_prenonce(const prenonce_signing_state_t *prenonce,
+                                                         const keyexpr_info_t *keyexpr_info,
+                                                         unsigned int cur_input_index,
+                                                         musig_secnonce_t *secnonce,
+                                                         musig_pubnonce_t *pubnonce) {
+    cx_ecfp_private_key_t private_key = {0};
+    bool ok = bip32_derive_init_privkey_256(CX_CURVE_256K1,
+                                            keyexpr_info->key_derivation,
+                                            keyexpr_info->key_derivation_length,
+                                            &private_key,
+                                            NULL) == CX_OK &&
+              musig_prenonce_derive(prenonce->state.nonce_init,
+                                    prenonce->j,
+                                    cur_input_index,
+                                    (uint32_t) keyexpr_info->index,
+                                    prenonce->wallet_id,
+                                    private_key.d,
+                                    keyexpr_info->internal_pubkey.compressed_pubkey,
+                                    keyexpr_info->pubkey.compressed_pubkey,
+                                    secnonce,
+                                    pubnonce);
+    explicit_bzero(&private_key, sizeof(private_key));
+    if (!ok) {
+        explicit_bzero(secnonce, sizeof(*secnonce));
+    }
+    return ok;
+}
+
+// Recomputes our pre-nonce for the input, checks that it is our pubnonce in the PSBT, and
+// aggregates the pubnonces of all the cosigners. On failure, it sends an error status word and the
+// secnonce is zeroed out.
+static bool __attribute__((noinline)) prepare_musig_prenonce_signing(
+    dispatcher_context_t *dc,
+    sign_psbt_state_t *st,
+    const prenonce_signing_state_t *prenonce,
+    const keyexpr_info_t *keyexpr_info,
+    const input_info_t *input,
+    unsigned int cur_input_index,
+    musig_per_input_info_t *musig_per_input_info,
+    musig_pubnonce_t *aggnonce,
+    musig_secnonce_t *secnonce) {
+    explicit_bzero(secnonce, sizeof(*secnonce));
+
+    if (!compute_musig_per_input_info(dc, st, input, keyexpr_info, musig_per_input_info)) {
+        return false;
+    }
+
+    uint8_t musig_my_psbt_id_key[MUSIG_PSBT_ID_KEY_MAX_LEN];
+    size_t musig_my_psbt_id_key_len;
+    musig_pubnonce_t my_pubnonce;
+    if (!read_my_musig_pubnonce(dc,
+                                keyexpr_info,
+                                input,
+                                musig_per_input_info,
+                                musig_my_psbt_id_key,
+                                &musig_my_psbt_id_key_len,
+                                &my_pubnonce)) {
+        SEND_SW_EC(dc, SW_INCORRECT_DATA, EC_SIGN_PSBT_MUSIG2_PRENONCE_MISSING_PUBNONCE);
+        return false;
+    }
+
+    musig_pubnonce_t pubnonce;
+    if (!derive_my_prenonce(prenonce, keyexpr_info, cur_input_index, secnonce, &pubnonce)) {
+        SEND_SW(dc, SW_BAD_STATE);  // should never happen
+        return false;
+    }
+
+    if (memcmp(&pubnonce, &my_pubnonce, sizeof(pubnonce)) != 0) {
+        PRINTF("The pubnonce in the PSBT is not the pre-nonce of j\n");
+        explicit_bzero(secnonce, sizeof(*secnonce));
+        SEND_SW_EC(dc, SW_INCORRECT_DATA, EC_SIGN_PSBT_MUSIG2_PRENONCE_PUBNONCE_MISMATCH);
+        return false;
+    }
+
+    if (!aggregate_musig_pubnonces(dc,
+                                   keyexpr_info,
+                                   input,
+                                   musig_per_input_info,
+                                   musig_my_psbt_id_key,
+                                   musig_my_psbt_id_key_len,
+                                   aggnonce)) {
+        explicit_bzero(secnonce, sizeof(*secnonce));
+        SEND_SW_EC(dc, SW_INCORRECT_DATA, EC_SIGN_PSBT_MUSIG2_PRENONCE_COSIGNER_PUBNONCE);
+        return false;
+    }
+    return true;
+}
+
+bool validate_musig_prenonce(dispatcher_context_t *dc,
+                             sign_psbt_state_t *st,
+                             signing_state_t *signing_state,
+                             const keyexpr_info_t *keyexpr_info,
+                             const input_info_t *input,
+                             unsigned int cur_input_index) {
+    LOG_PROCESSOR(__FILE__, __LINE__, __func__);
+
+    musig_per_input_info_t musig_per_input_info;
+    musig_pubnonce_t aggnonce;
+    musig_secnonce_t secnonce;
+    bool ok = prepare_musig_prenonce_signing(dc,
+                                             st,
+                                             &signing_state->prenonce,
+                                             keyexpr_info,
+                                             input,
+                                             cur_input_index,
+                                             &musig_per_input_info,
+                                             &aggnonce,
+                                             &secnonce);
+    explicit_bzero(&secnonce, sizeof(secnonce));
+    return ok;
+}
+
+bool __attribute__((noinline)) sign_sighash_musig_prenonce_and_yield(
+    dispatcher_context_t *dc,
+    sign_psbt_state_t *st,
+    signing_state_t *signing_state,
+    const keyexpr_info_t *keyexpr_info,
+    const input_info_t *input,
+    unsigned int cur_input_index,
+    uint8_t sighash[static 32]) {
+    LOG_PROCESSOR(__FILE__, __LINE__, __func__);
+
+    // a partial signature is only produced once j is consumed in NVRAM
+    if (!signing_state->prenonce.committed) {
+        PRINTF("The pre-nonce j was not consumed\n");
+        SEND_SW(dc, SW_BAD_STATE);  // should never happen
+        return false;
+    }
+
+    musig_per_input_info_t musig_per_input_info;
+    musig_pubnonce_t aggnonce;
+    musig_secnonce_t secnonce;
+    if (!prepare_musig_prenonce_signing(dc,
+                                        st,
+                                        &signing_state->prenonce,
+                                        keyexpr_info,
+                                        input,
+                                        cur_input_index,
+                                        &musig_per_input_info,
+                                        &aggnonce,
+                                        &secnonce)) {
+        return false;
+    }
+
+    return sign_musig_and_yield_partial_signature(dc,
+                                                  st,
+                                                  keyexpr_info,
+                                                  &musig_per_input_info,
+                                                  cur_input_index,
+                                                  &aggnonce,
+                                                  &secnonce,
+                                                  sighash);
+}
+
+#endif  // HAVE_MUSIG2_PRENONCES

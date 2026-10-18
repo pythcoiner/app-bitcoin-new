@@ -77,3 +77,36 @@ bool sign_sighash_musig_and_yield(dispatcher_context_t *dc,
                                   const input_info_t *input,
                                   unsigned int cur_input_index,
                                   uint8_t sighash[static 32]);
+
+#ifdef HAVE_MUSIG2_PRENONCES
+/**
+ * Checks, before the user review of a one-round MuSig2 signing, that our pubnonce in the PSBT is
+ * the pre-nonce of j for the current input and key expression, and that the pubnonces of all the
+ * cosigners are present and can be aggregated.
+ *
+ * Returns true if the check is successful, false otherwise. In case of failure, it already sends an
+ * error status word.
+ */
+bool validate_musig_prenonce(dispatcher_context_t *dc,
+                             sign_psbt_state_t *st,
+                             signing_state_t *signing_state,
+                             const keyexpr_info_t *keyexpr_info,
+                             const input_info_t *input,
+                             unsigned int cur_input_index);
+
+/**
+ * Computes and yields the partial signature for a certain sighash in a one-round MuSig2 signing,
+ * with the pre-nonce of j. It requires j to be already consumed in NVRAM, and never touches the
+ * sessions of the two-round flow.
+ *
+ * Returns true if the computation is successful, false otherwise. In case of failure, it already
+ * sends an error status word.
+ */
+bool sign_sighash_musig_prenonce_and_yield(dispatcher_context_t *dc,
+                                           sign_psbt_state_t *st,
+                                           signing_state_t *signing_state,
+                                           const keyexpr_info_t *keyexpr_info,
+                                           const input_info_t *input,
+                                           unsigned int cur_input_index,
+                                           uint8_t sighash[static 32]);
+#endif

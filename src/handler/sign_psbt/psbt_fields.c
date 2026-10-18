@@ -132,6 +132,50 @@ psbt_field_status_t psbt_get_global_fallback_locktime(dispatcher_context_t *dc,
     return read_u32_le_field(dc, global_map, PSBT_GLOBAL_FALLBACK_LOCKTIME, out);
 }
 
+#ifdef HAVE_MUSIG2_PRENONCES
+// BIP-174 proprietary identifier and subtype of the pre-nonce j field
+static const uint8_t musig2_prenonce_identifier[] =
+    {'M', 'U', 'S', 'I', 'G', '2', '_', 'P', 'R', 'E', 'N', 'O', 'N', 'C', 'E'};
+#define MUSIG2_PRENONCE_J_SUBTYPE 0x00
+
+// key type, identifier length, identifier, subtype
+#define MUSIG2_PRENONCE_J_KEY_PREFIX_LEN (1 + 1 + sizeof(musig2_prenonce_identifier) + 1)
+
+static void write_musig2_prenonce_j_key_prefix(
+    uint8_t out[static MUSIG2_PRENONCE_J_KEY_PREFIX_LEN]) {
+    out[0] = PSBT_GLOBAL_PROPRIETARY;
+    out[1] = sizeof(musig2_prenonce_identifier);
+    memcpy(out + 2, musig2_prenonce_identifier, sizeof(musig2_prenonce_identifier));
+    out[2 + sizeof(musig2_prenonce_identifier)] = MUSIG2_PRENONCE_J_SUBTYPE;
+}
+
+bool psbt_is_global_musig2_prenonce_j_key(const uint8_t *key, size_t key_len) {
+    uint8_t prefix[MUSIG2_PRENONCE_J_KEY_PREFIX_LEN];
+    write_musig2_prenonce_j_key_prefix(prefix);
+    return key_len >= sizeof(prefix) && memcmp(key, prefix, sizeof(prefix)) == 0;
+}
+
+psbt_field_status_t psbt_get_global_musig2_prenonce_j(dispatcher_context_t *dc,
+                                                      const merkleized_map_commitment_t *global_map,
+                                                      const uint8_t pk[static 33],
+                                                      uint32_t *out) {
+    uint8_t key[MUSIG2_PRENONCE_J_KEY_PREFIX_LEN + 33];
+    write_musig2_prenonce_j_key_prefix(key);
+    memcpy(key + MUSIG2_PRENONCE_J_KEY_PREFIX_LEN, pk, 33);
+
+    uint8_t raw[4];
+    int res = call_get_merkleized_map_value(dc, global_map, key, sizeof(key), raw, sizeof(raw));
+    if (res == MAP_VALUE_ABSENT) {
+        return PSBT_FIELD_ABSENT;
+    }
+    if (res != sizeof(raw)) {
+        return PSBT_FIELD_ERROR;
+    }
+    *out = read_u32_be(raw, 0);
+    return PSBT_FIELD_PRESENT;
+}
+#endif
+
 /* -------------------------------------------------------------------------- */
 /* Input map                                                                  */
 /* -------------------------------------------------------------------------- */

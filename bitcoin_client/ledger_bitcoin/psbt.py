@@ -774,6 +774,11 @@ class PSBT(object):
     PSBT_GLOBAL_TX_MODIFIABLE = 0x06
     PSBT_GLOBAL_GENERIC_SIGNED_MESSAGE = 0x09
     PSBT_GLOBAL_VERSION = 0xFB
+    PSBT_GLOBAL_PROPRIETARY = 0xFC
+
+    # proprietary identifier and subtype of the field carrying the pre-nonce batch j of a MuSig2 signer
+    MUSIG2_PRENONCE_IDENTIFIER = b"MUSIG2_PRENONCE"
+    MUSIG2_PRENONCE_SUBTYPE = 0x00
 
     def __init__(self, tx: Optional[CTransaction] = None) -> None:
         """
@@ -984,6 +989,39 @@ class PSBT(object):
             raise PSBTSerializationError("Outputs provided does not match the number of outputs in transaction")
 
         self.cache_unsigned_tx_pieces()
+
+    @classmethod
+    def _musig2_prenonce_j_key(cls, pk: bytes) -> bytes:
+        return b"".join([
+            ser_compact_size(cls.PSBT_GLOBAL_PROPRIETARY),
+            ser_string(cls.MUSIG2_PRENONCE_IDENTIFIER),
+            ser_compact_size(cls.MUSIG2_PRENONCE_SUBTYPE),
+            pk,
+        ])
+
+    def set_musig2_prenonce_j(self, pk: bytes, j: int) -> None:
+        """
+        Sets the pre-nonce batch j used by the MuSig2 signer with participant key `pk` for a one-round signing.
+
+        :param pk: The 33-byte compressed participant key of the signer.
+        :param j: The index of the pre-nonce batch.
+        """
+        if len(pk) != 33:
+            raise ValueError("pk must be a 33-byte compressed pubkey")
+        self.unknown[self._musig2_prenonce_j_key(pk)] = struct.pack(">I", j)
+
+    def get_musig2_prenonce_j(self, pk: bytes) -> Optional[int]:
+        """
+        Returns the pre-nonce batch j of the MuSig2 signer with participant key `pk`, or None if absent.
+
+        :param pk: The 33-byte compressed participant key of the signer.
+        """
+        value = self.unknown.get(self._musig2_prenonce_j_key(pk))
+        if value is None:
+            return None
+        if len(value) != 4:
+            raise PSBTSerializationError("Pre-nonce j field must be 4 bytes")
+        return struct.unpack(">I", value)[0]
 
     def serialize(self) -> str:
         """

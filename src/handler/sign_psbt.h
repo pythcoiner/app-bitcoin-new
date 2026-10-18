@@ -21,6 +21,9 @@
 #include "display.h"
 #include "merkle.h"
 #include "musig_sessions.h"
+#ifdef HAVE_MUSIG2_PRENONCES
+#include "prenonce_storage.h"
+#endif
 
 // common info that applies to either the current input or the current output
 typedef struct {
@@ -131,10 +134,24 @@ typedef struct tx_hashes_s {
     uint8_t sha_outputs[32];
 } tx_hashes_t;
 
+#ifdef HAVE_MUSIG2_PRENONCES
+// State of a one-round MuSig2 signing with pre-issued nonces
+typedef struct {
+    bool active;     // the PSBT has the pre-nonce j field for our participant key
+    bool committed;  // j was consumed in NVRAM during this signing call
+    uint32_t j;
+    uint8_t wallet_id[32];
+    prenonce_state_t state;  // as loaded at validation; holds nonce_init
+} prenonce_signing_state_t;
+#endif
+
 // the signing state for the current transaction; it does not contain any per-input state
 typedef struct signing_state_s {
     tx_hashes_t tx_hashes;
     musig_signing_state_t musig;
+#ifdef HAVE_MUSIG2_PRENONCES
+    prenonce_signing_state_t prenonce;
+#endif
 } signing_state_t;
 
 // We cache the first MAX_EXT_OUTPUT_SIMPLIFIED_NUMBER external outputs;
@@ -209,6 +226,11 @@ typedef struct {
 
     // set to true if at least a PSBT_IN_MUSIG2_PUB_NONCE field is present in the PSBT
     bool has_musig2_pub_nonces;
+
+#ifdef HAVE_MUSIG2_PRENONCES
+    // set to true if at least a key of the global map is a pre-nonce j field, of any signer
+    bool has_musig2_prenonce_j;
+#endif
 
     // aggregate info on outputs
     struct {

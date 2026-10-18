@@ -70,6 +70,23 @@ psbt_field_status_t psbt_get_global_fallback_locktime(dispatcher_context_t *dc,
                                                       const merkleized_map_commitment_t *global_map,
                                                       uint32_t *out);
 
+#ifdef HAVE_MUSIG2_PRENONCES
+/**
+ * Returns true if the key is a pre-nonce j field, of any participant key: a PSBT_GLOBAL_PROPRIETARY
+ * key with identifier "MUSIG2_PRENONCE" and subtype 0x00.
+ */
+bool psbt_is_global_musig2_prenonce_j_key(const uint8_t *key, size_t key_len);
+
+/**
+ * Pre-nonce j field of the participant key pk: key 0xFC || 0x0F || "MUSIG2_PRENONCE" || 0x00 || pk,
+ * value 4-byte big-endian j. Optional: ABSENT means that pk does not sign in one round.
+ */
+psbt_field_status_t psbt_get_global_musig2_prenonce_j(dispatcher_context_t *dc,
+                                                      const merkleized_map_commitment_t *global_map,
+                                                      const uint8_t pk[static 33],
+                                                      uint32_t *out);
+#endif
+
 /* -------------------------------------------------------------------------- */
 /* Input map                                                                  */
 /* -------------------------------------------------------------------------- */

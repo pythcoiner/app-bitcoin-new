@@ -111,6 +111,14 @@ static void sign_psbt(dispatcher_context_t *dc,
         return;
     }
 
+#ifdef HAVE_MUSIG2_PRENONCES
+    // One-round MuSig2: everything is checked before the review, nothing is consumed yet
+    if (st->has_musig2_prenonce_j &&
+        !validate_musig2_prenonces(dc, st, signing_state, cache, internal_inputs)) {
+        return;
+    }
+#endif /* HAVE_MUSIG2_PRENONCES */
+
     if (!st->has_musig2_pub_nonces) {
         // We execute the first round of MuSig for any musig2 key expression, producing the
         // pubnonces; this does not involve the private keys, therefore we can do it without user
@@ -160,7 +168,13 @@ static void sign_psbt(dispatcher_context_t *dc,
          * For each internal key expression, and for each internal input, sign using the
          * appropriate algorithm.
          */
-        int sign_result = sign_transaction(dc, st, cache, signing_state, internal_inputs);
+        int sign_result = true;
+#ifdef HAVE_MUSIG2_PRENONCES
+        // One-round MuSig2: j is consumed before any partial signature is computed
+        sign_result = commit_musig2_prenonce(dc, signing_state);
+#endif /* HAVE_MUSIG2_PRENONCES */
+        sign_result =
+            sign_result && sign_transaction(dc, st, cache, signing_state, internal_inputs);
 
 #ifdef HAVE_SWAP
         if (!G_called_from_swap)

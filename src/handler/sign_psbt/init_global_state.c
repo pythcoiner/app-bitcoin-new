@@ -131,6 +131,11 @@ static void global_map_keys_callback(dispatcher_context_t *dc,
         data->ptr[data->offset] == PSBT_GLOBAL_GENERIC_SIGNED_MESSAGE) {
         st->bip322.is_message_signing = true;
     }
+#ifdef HAVE_MUSIG2_PRENONCES
+    if (psbt_is_global_musig2_prenonce_j_key(data->ptr + data->offset, data->size - data->offset)) {
+        st->has_musig2_prenonce_j = true;
+    }
+#endif
 }
 
 /**
@@ -146,7 +151,7 @@ static bool __attribute__((noinline)) process_global_map(dispatcher_context_t *d
     // Check integrity of the global map (this also marks it as validated, so that its values may
     // be read by key below).
     // This also walks over all keys in the global map, keeping track of any fields
-    // we care about tracking (currently, only the presence of a BIP-322 signature request)
+    // we care about tracking (a BIP-322 signature request, and the pre-nonce j fields)
     st->bip322.is_message_signing = false;
     if (call_check_merkleized_map_sorted_with_callback(dc,
                                                        &st->global_map,
