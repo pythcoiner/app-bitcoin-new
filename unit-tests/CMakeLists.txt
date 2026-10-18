@@ -110,6 +110,8 @@ add_library(write       SHARED $ENV{BOLOS_SDK}/lib_standard_app/write.c)
 add_library(buffer_ext  SHARED ../src/common/buffer_ext.c)
 add_library(parser      SHARED ../src/common/parser_ext.c)
 add_library(display_utils SHARED ../src/ui/display_utils.c)
+add_library(prenonce_window SHARED ../src/musig/prenonce_window.c)
+target_include_directories(prenonce_window PUBLIC ../src/common ../src/musig)
 
 # ---------------------------------------------------------------------------
 # Test executables (non-speculos)
@@ -133,6 +135,7 @@ add_unit_test(test_buffer        LIBS test_common buffer buffer_ext varint read 
 add_unit_test(test_display_utils LIBS test_common display_utils)
 add_unit_test(test_parser        LIBS test_common parser buffer buffer_ext varint read write bip32)
 add_unit_test(test_psbt_parse    LIBS test_common psbt_parse)
+add_unit_test(test_prenonce_window LIBS test_common prenonce_window)
 
 # ---------------------------------------------------------------------------
 # Speculos-backed crypto tests
