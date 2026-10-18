@@ -349,6 +349,13 @@ if(SPECULOS AND SPECULOS_SRC)
   target_link_libraries(test_musig PRIVATE cmocka app_crypto)
   add_test(test_musig test_musig)
 
+  # test_musig_prenonce exercises src/musig/musig_prenonce.c against the vectors printed by
+  # test_utils/gen_prenonce_vectors.py.
+  add_executable(test_musig_prenonce test_musig_prenonce.c ../src/musig/musig_prenonce.c)
+  app_apply_real_sdk_config(test_musig_prenonce)
+  target_link_libraries(test_musig_prenonce PRIVATE cmocka app_crypto)
+  add_test(test_musig_prenonce test_musig_prenonce)
+
   # test_prenonce_storage exercises src/musig/prenonce_storage.c with the slots in RAM and an
   # nvm_write mock that cuts writes at any byte.
   add_executable(test_prenonce_storage test_prenonce_storage.c ../src/musig/prenonce_storage.c)
