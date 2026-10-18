@@ -76,7 +76,8 @@ static inline int compare_plain_pk(const void *a, const void *b) {
 int musig_key_agg(const plain_pk_t pubkeys[], size_t n_keys, musig_keyagg_context_t *ctx);
 
 /**
- * Generates secret and public nonces (round 1 of MuSig per BIP-0327).
+ * Generates secret and public nonces (round 1 of MuSig per BIP-0327), with sk, msg and extra_in
+ * absent.
  *
  * @param[in]  rand
  *   The randomness to use.
@@ -99,6 +100,47 @@ int musig_nonce_gen(const uint8_t *rand,
                     const xonly_pk_t aggpk,
                     musig_secnonce_t *secnonce,
                     musig_pubnonce_t *pubnonce);
+
+/**
+ * Generates secret and public nonces (round 1 of MuSig per BIP-0327), with the optional arguments
+ * of NonceGen. aggpk is compulsory.
+ *
+ * @param[in]  rand
+ *   The randomness to use.
+ * @param[in]  rand_len
+ *  The length of the randomness.
+ * @param[in]  sk
+ *   The 32-byte secret key of the signer, or NULL if absent.
+ * @param[in]  pk
+ *   The 33-byte public key of the signer.
+ * @param[in]  aggpk
+ *   The 32-byte x-only aggregate public key.
+ * @param[in]  msg
+ *   The message, or NULL if absent. An empty message is not the same as an absent one.
+ * @param[in]  msg_len
+ *   The length of the message.
+ * @param[in]  extra_in
+ *   The extra input, or NULL if absent.
+ * @param[in]  extra_in_len
+ *   The length of the extra input.
+ * @param[out] secnonce
+ *   Pointer to receive the secret nonce.
+ * @param[out] pubnonce
+ *   Pointer to receive the public nonce.
+ *
+ * @return 0 on success, a negative number in case of error.
+ */
+int musig_nonce_gen_ext(const uint8_t *rand,
+                        size_t rand_len,
+                        const uint8_t *sk,
+                        const plain_pk_t pk,
+                        const xonly_pk_t aggpk,
+                        const uint8_t *msg,
+                        size_t msg_len,
+                        const uint8_t *extra_in,
+                        size_t extra_in_len,
+                        musig_secnonce_t *secnonce,
+                        musig_pubnonce_t *pubnonce);
 
 /**
  * Generates the aggregate nonce (nonce_agg in the reference implementation).

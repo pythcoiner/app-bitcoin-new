@@ -14,6 +14,7 @@ static const uint8_t BIP0327_keyagg_coeff_tag[] =
 static const uint8_t BIP0327_keyagg_list_tag[] =
     {'K', 'e', 'y', 'A', 'g', 'g', ' ', 'l', 'i', 's', 't'};
 static const uint8_t BIP0327_nonce_tag[] = {'M', 'u', 'S', 'i', 'g', '/', 'n', 'o', 'n', 'c', 'e'};
+static const uint8_t BIP0327_aux_tag[] = {'M', 'u', 'S', 'i', 'g', '/', 'a', 'u', 'x'};
 static const uint8_t BIP0327_noncecoef_tag[] =
     {'M', 'u', 'S', 'i', 'g', '/', 'n', 'o', 'n', 'c', 'e', 'c', 'o', 'e', 'f'};
 
@@ -221,13 +222,14 @@ int musig_key_agg(const plain_pk_t pubkeys[], size_t n_keys, musig_keyagg_contex
     return 0;
 }
 
+// msg is NULL when absent, which BIP-327 hashes differently from an empty msg
 static void musig_nonce_hash(const uint8_t *rand,
                              size_t rand_len,
                              const plain_pk_t pk,
                              const xonly_pk_t aggpk,
                              uint8_t i,
-                             const uint8_t *msg_prefixed,
-                             size_t msg_prefixed_len,
+                             const uint8_t *msg,
+                             size_t msg_len,
                              const uint8_t *extra_in,
                              size_t extra_in_len,
                              uint8_t out[static CX_SHA256_SIZE]) {
@@ -245,8 +247,16 @@ static void musig_nonce_hash(const uint8_t *rand,
     crypto_hash_update_u8(&hash_context.header, sizeof(xonly_pk_t));
     crypto_hash_update(&hash_context.header, aggpk, sizeof(xonly_pk_t));
 
-    // msg_prefixed
-    crypto_hash_update(&hash_context.header, msg_prefixed, msg_prefixed_len);
+    // msg_prefixed: 0x00 if msg is absent, otherwise 0x01 + len(msg) (8 bytes) + msg
+    if (msg == NULL) {
+        crypto_hash_update_u8(&hash_context.header, 0x00);
+    } else {
+        uint8_t msg_len_be[8];
+        write_u64_be(msg_len_be, 0, msg_len);
+        crypto_hash_update_u8(&hash_context.header, 0x01);
+        crypto_hash_update(&hash_context.header, msg_len_be, sizeof(msg_len_be));
+        crypto_hash_update(&hash_context.header, msg, msg_len);
+    }
 
     // len(extra_in) (4 bytes) + extra_in
     crypto_hash_update_u32(&hash_context.header, extra_in_len);
@@ -259,20 +269,58 @@ static void musig_nonce_hash(const uint8_t *rand,
     crypto_hash_digest(&hash_context.header, out, CX_SHA256_SIZE);
 }
 
-// same as nonce_gen_internal from the reference, removing the optional arguments sk, msg and
-// extra_in, and making aggpk compulsory
-int musig_nonce_gen(const uint8_t *rand,
-                    size_t rand_len,
-                    const plain_pk_t pk,
-                    const xonly_pk_t aggpk,
-                    musig_secnonce_t *secnonce,
-                    musig_pubnonce_t *pubnonce) {
-    uint8_t msg[] = {0x00};
+// same as nonce_gen_internal from the reference, making aggpk compulsory
+int musig_nonce_gen_ext(const uint8_t *rand,
+                        size_t rand_len,
+                        const uint8_t *sk,
+                        const plain_pk_t pk,
+                        const xonly_pk_t aggpk,
+                        const uint8_t *msg,
+                        size_t msg_len,
+                        const uint8_t *extra_in,
+                        size_t extra_in_len,
+                        musig_secnonce_t *secnonce,
+                        musig_pubnonce_t *pubnonce) {
+    // with sk, rand := sk XOR tagged_hash("MuSig/aux", rand)
+    uint8_t rand_sk[CX_SHA256_SIZE];
+    if (sk != NULL) {
+        crypto_tr_tagged_hash(BIP0327_aux_tag,
+                              sizeof(BIP0327_aux_tag),
+                              rand,
+                              rand_len,
+                              NULL,
+                              0,
+                              rand_sk);
+        for (size_t i = 0; i < sizeof(rand_sk); i++) {
+            rand_sk[i] ^= sk[i];
+        }
+        rand = rand_sk;
+        rand_len = sizeof(rand_sk);
+    }
 
-    musig_nonce_hash(rand, rand_len, pk, aggpk, 0, msg, 1, NULL, 0, secnonce->k_1);
+    musig_nonce_hash(rand,
+                     rand_len,
+                     pk,
+                     aggpk,
+                     0,
+                     msg,
+                     msg_len,
+                     extra_in,
+                     extra_in_len,
+                     secnonce->k_1);
     if (CX_OK != cx_math_modm_no_throw(secnonce->k_1, 32, secp256k1_n, 32)) goto nonce_gen_fail;
-    musig_nonce_hash(rand, rand_len, pk, aggpk, 1, msg, 1, NULL, 0, secnonce->k_2);
+    musig_nonce_hash(rand,
+                     rand_len,
+                     pk,
+                     aggpk,
+                     1,
+                     msg,
+                     msg_len,
+                     extra_in,
+                     extra_in_len,
+                     secnonce->k_2);
     if (CX_OK != cx_math_modm_no_throw(secnonce->k_2, 32, secp256k1_n, 32)) goto nonce_gen_fail;
+    explicit_bzero(rand_sk, sizeof(rand_sk));
 
     if (is_array_all_zeros(secnonce->k_1, sizeof(secnonce->k_1)) ||
         is_array_all_zeros(secnonce->k_2, sizeof(secnonce->k_2))) {
@@ -293,9 +341,29 @@ int musig_nonce_gen(const uint8_t *rand,
     return 0;
 
 nonce_gen_fail:
+    explicit_bzero(rand_sk, sizeof(rand_sk));
     explicit_bzero(secnonce->k_1, sizeof(secnonce->k_1));
     explicit_bzero(secnonce->k_2, sizeof(secnonce->k_2));
     return -1;
+}
+
+int musig_nonce_gen(const uint8_t *rand,
+                    size_t rand_len,
+                    const plain_pk_t pk,
+                    const xonly_pk_t aggpk,
+                    musig_secnonce_t *secnonce,
+                    musig_pubnonce_t *pubnonce) {
+    return musig_nonce_gen_ext(rand,
+                               rand_len,
+                               NULL,
+                               pk,
+                               aggpk,
+                               NULL,
+                               0,
+                               NULL,
+                               0,
+                               secnonce,
+                               pubnonce);
 }
 
 int musig_nonce_agg(const musig_pubnonce_t pubnonces[], size_t n_keys, musig_pubnonce_t *out) {

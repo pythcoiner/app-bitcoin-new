@@ -7,13 +7,14 @@
  * Only the vectors applicable to the subset of BIP-327 implemented by the app are used:
  * - key_sort_vectors.json    -> compare_plain_pk
  * - key_agg_vectors.json     -> musig_key_agg (tweaking is tested via musig_sign)
+ * - nonce_gen_vectors.json   -> musig_nonce_gen_ext (cases with aggpk present)
  * - nonce_agg_vectors.json   -> musig_nonce_agg
  * - sign_verify_vectors.json -> musig_sign (signing cases only; there is no verification)
  * - tweak_vectors.json       -> musig_sign with tweaks
  *
- * musig_nonce_gen only supports a subset of the optional arguments of BIP-327's NonceGen (sk, msg
- * and extra_in are always absent, while aggpk is always present), which none of the official
- * nonce_gen_vectors.json cases match; see the comment on the nonce_gen tests below.
+ * nonce_gen_vectors.json is taken from bitcoin/bips at commit
+ * 927b6de9915c9262615a6399de51b200f81e5aa4. Its last case has aggpk absent, which
+ * musig_nonce_gen_ext does not support.
  */
 
 #include <stdarg.h>
@@ -699,6 +700,91 @@ static void test_nonce_gen(void **state) {
     }
 }
 
+/* ---------------------------------------------------------------- */
+/* nonce_gen_vectors.json                                           */
+/* ---------------------------------------------------------------- */
+
+typedef struct {
+    const char *msg;
+    const char *expected_secnonce;
+    const char *expected_pubnonce;
+} nonce_gen_ext_case_t;
+
+// rand_, sk, pk, aggpk and extra_in are the same in all the cases
+#define NONCE_GEN_EXT_RAND     "0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F"
+#define NONCE_GEN_EXT_SK       "0202020202020202020202020202020202020202020202020202020202020202"
+#define NONCE_GEN_EXT_PK       "024D4B6CD1361032CA9BD2AEB9D900AA4D45D9EAD80AC9423374C451A7254D0766"
+#define NONCE_GEN_EXT_AGGPK    "0707070707070707070707070707070707070707070707070707070707070707"
+#define NONCE_GEN_EXT_EXTRA_IN "0808080808080808080808080808080808080808080808080808080808080808"
+
+// clang-format off
+static const nonce_gen_ext_case_t nonce_gen_ext_cases[] = {
+    {
+        "0101010101010101010101010101010101010101010101010101010101010101",
+        "B114E502BEAA4E301DD08A50264172C84E41650E6CB726B410C0694D59EFFB6495B5CAF28D045B973D63E3C99A44B807BDE375FD6CB39E46DC4A511708D0E9D2024D4B6CD1361032CA9BD2AEB9D900AA4D45D9EAD80AC9423374C451A7254D0766",
+        "02F7BE7089E8376EB355272368766B17E88E7DB72047D05E56AA881EA52B3B35DF02C29C8046FDD0DED4C7E55869137200FBDBFE2EB654267B6D7013602CAED3115A",
+    },
+    {
+        "",
+        "E862B068500320088138468D47E0E6F147E01B6024244AE45EAC40ACE5929B9F0789E051170B9E705D0B9EB49049A323BBBBB206D8E05C19F46C6228742AA7A9024D4B6CD1361032CA9BD2AEB9D900AA4D45D9EAD80AC9423374C451A7254D0766",
+        "023034FA5E2679F01EE66E12225882A7A48CC66719B1B9D3B6C4DBD743EFEDA2C503F3FD6F01EB3A8E9CB315D73F1F3D287CAFBB44AB321153C6287F407600205109",
+    },
+    {
+        "2626262626262626262626262626262626262626262626262626262626262626262626262626",
+        "3221975ACBDEA6820EABF02A02B7F27D3A8EF68EE42787B88CBEFD9AA06AF3632EE85B1A61D8EF31126D4663A00DD96E9D1D4959E72D70FE5EBB6E7696EBA66F024D4B6CD1361032CA9BD2AEB9D900AA4D45D9EAD80AC9423374C451A7254D0766",
+        "02E5BBC21C69270F59BD634FCBFA281BE9D76601295345112C58954625BF23793A021307511C79F95D38ACACFF1B4DA98228B77E65AA216AD075E9673286EFB4EAF3",
+    },
+};
+// clang-format on
+
+#define NONCE_GEN_EXT_MAX_MSG_LEN 64
+
+static void test_nonce_gen_ext(void **state) {
+    (void) state;
+
+    uint8_t rand[32];
+    uint8_t sk[32];
+    plain_pk_t pk;
+    xonly_pk_t aggpk;
+    uint8_t extra_in[32];
+    unhex_exact(NONCE_GEN_EXT_RAND, rand, sizeof(rand));
+    unhex_exact(NONCE_GEN_EXT_SK, sk, sizeof(sk));
+    unhex_exact(NONCE_GEN_EXT_PK, pk, sizeof(pk));
+    unhex_exact(NONCE_GEN_EXT_AGGPK, aggpk, sizeof(aggpk));
+    unhex_exact(NONCE_GEN_EXT_EXTRA_IN, extra_in, sizeof(extra_in));
+
+    for (size_t t = 0; t < sizeof(nonce_gen_ext_cases) / sizeof(nonce_gen_ext_cases[0]); t++) {
+        const nonce_gen_ext_case_t *tc = &nonce_gen_ext_cases[t];
+
+        uint8_t msg[NONCE_GEN_EXT_MAX_MSG_LEN];
+        size_t msg_len = unhex(tc->msg, msg, sizeof(msg));
+
+        musig_secnonce_t secnonce;
+        musig_pubnonce_t pubnonce;
+        assert_int_equal(musig_nonce_gen_ext(rand,
+                                             sizeof(rand),
+                                             sk,
+                                             pk,
+                                             aggpk,
+                                             msg,
+                                             msg_len,
+                                             extra_in,
+                                             sizeof(extra_in),
+                                             &secnonce,
+                                             &pubnonce),
+                         0);
+
+        musig_secnonce_t expected_secnonce;
+        musig_pubnonce_t expected_pubnonce;
+        unhex_exact(tc->expected_secnonce,
+                    (uint8_t *) &expected_secnonce,
+                    sizeof(expected_secnonce));
+        unhex_exact(tc->expected_pubnonce, expected_pubnonce.raw, sizeof(expected_pubnonce.raw));
+        assert_memory_equal(&secnonce, &expected_secnonce, sizeof(secnonce));
+        assert_memory_equal(pubnonce.raw, expected_pubnonce.raw, sizeof(pubnonce.raw));
+    }
+}
+
 int main(void) {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test(test_key_sort),
@@ -706,6 +792,7 @@ int main(void) {
         cmocka_unit_test(test_key_agg_invalid_pubkey),
         cmocka_unit_test(test_key_agg_tweak_infinity),
         cmocka_unit_test(test_nonce_gen),
+        cmocka_unit_test(test_nonce_gen_ext),
         cmocka_unit_test(test_nonce_agg),
         cmocka_unit_test(test_sign_valid),
         cmocka_unit_test(test_sign_error),
